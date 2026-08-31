@@ -1,0 +1,69 @@
+common:
+  key: "change-me"
+  request_template: null
+  max_read_size: 512
+  udp_frag_size: 1200
+
+generate:
+  outdir: "tunnels"
+  file: null
+  httpcode: 200
+  read_buff: 513
+  udp_max_size: 256
+
+connect:
+  url:
+    - "http://127.0.0.1/tunnel.php"
+  redirect_url: []
+  force_redirect: false
+  target: null
+  remote: false
+  tun: null
+  tun_cidr: null
+  tun_mtu: 1400
+
+  listen_on: "127.0.0.1"
+  listen_port: 1080
+
+  skip: false
+  header: []
+  cookie: null
+  proxy: null
+
+  async_connect: false
+  php_skip_cookie: false
+  go: false
+  php_connect_timeout: 0.5
+  local_dns: false
+
+  read_buff: 7
+  udp_max_size: 256
+  udp_timeout: 30
+  # Transport modes: auto, classic, half-duplex, full-duplex, h2, h3.
+  mode: "auto"
+  auto_tune: false
+
+  # Compression modes: optimal, dynamic, smart.
+  client_compression: "optimal"
+  server_compression: "optimal"
+  client_optimal_limit: 1024
+  server_optimal_limit: 1024
+
+  read_interval: 300
+  write_interval: 200
+  max_threads: 400
+  max_retry: 10
+
+  cut_left: 0
+  cut_right: 0
+  extract: null
+
+  ntlm_auth: null
+  socks_user: null
+  socks_hash: null
+  # SOCKS5 server only; not applied to fixed/local or remote port forwarding.
+  blacklist: []
+
+  half_close: false
+
+  verbose: 0
