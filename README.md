@@ -1,8 +1,41 @@
 # Roger
 
-Roger is an advanced tool for pivoting and tunneling traffic over web servers. It can expose a SOCKS5 proxy or TUN interface, and it also supports local and remote port forwarding.
+Roger is an advanced tool for pivoting and tunneling traffic over web servers. The project is based on Neo-reGeorg, but extends it with stronger transport modes, better stability, richer protocol features, and broader runtime support. It can expose a SOCKS5 proxy or TUN interface, and it also supports local and remote port forwarding.
 
 > This tool is limited to safety research and teaching, and the user assumes all legal and related responsibilities caused by the use of this tool! The author does not bear any legal and related responsibilities!
+
+## Roger vs Neo-reGeorg vs suo5
+
+| Feature | Neo-reGeorg | suo5 | Roger |
+| --- | --- | --- | --- |
+| HTTP-based tunneling | ✅ | ✅ | ✅ |
+| Client | Python | Golang | Golang |
+| Server templates | PHP,<br> Go,<br> JavaScript,<br> JSP,<br> JSPX,<br> ASPX,<br> ASHX | Java,<br> .NET,<br> PHP | PHP,<br> Go,<br> JavaScript,<br> JSP,<br> JSPX,<br> ASPX,<br> ASHX |
+| Multiple tunnel URLs | ✅ | ✅ via redirect/retry/load-balancing logic | ✅ |
+| Custom HTTP headers | ✅ | ✅ | ✅ |
+| Custom cookies | ✅ | partially, via raw headers / cookie jar | ✅ |
+| Upstream HTTP/SOCKS proxy | ✅ | ✅ | ✅ |
+| Custom request template | ✅ | ❌ | ✅ |
+| Camouflage response body | ✅ | ❌ | ✅ |
+| Custom HTTP response code | ✅ | ❌ | ✅ |
+| Response body extraction | ✅ | ❌ | ✅ |
+| SOCKS5 support | partially, CONNECT only | partially, CONNECT only | full: CONNECT, BIND, UDP_ASSOCIATE |
+| TCP half-close support | ❌ | ✅ | ✅ |
+| Transport modes | Classic | auto,<br> full,<br> half,<br> classic | auto,<br> classic,<br> half-duplex,<br> full-duplex,<br> HTTP/2,<br> HTTP/3 |
+| Traffic compression modes | None | gzip on,<br> gzip off | smart,<br> dynamic,<br> optimal |
+| Runtime protocol settings | ❌ | partially, handshake/config driven | ✅ |
+| Auto-tune protocol parameters | ❌ | ❌ | ✅ |
+| SOCKS5 auth | ❌ | ✅ | ✅ |
+| Local port forwarding | ✅ | ✅ | ✅ |
+| Remote port forwarding | ❌ | ❌ | ✅ |
+| Built-in TUN interface mode | ❌ | ❌ | ✅ |
+| Config file | ❌ | JSON | YAML |
+| GUI | ❌ | ✅ | ❌ |
+| Heartbeat / keepalive | ❌ | ✅ | ✅ |
+| Load-balancing / reverse-proxy support | basic | ✅ | ✅ |
+| Automatic transport selection | ❌ | ✅ | ✅ |
+
+
 
 ## Client
 
@@ -94,13 +127,13 @@ Supported modes by template:
 
 | Template | Language/runtime | classic | half-duplex | full-duplex | h2 | h3 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `tunnel.go` | Go | yes | yes | yes | yes | yes |
-| `tunnel.js` | Node.js | yes | yes | yes | yes | no |
-| `tunnel.jsp` | Java/JSP | yes | yes | yes | no | no |
-| `tunnel.jspx` | Java/JSPX | yes | yes | yes | no | no |
-| `tunnel.php` | PHP | yes | yes | no | no | no |
-| `tunnel.aspx` | C#/ASPX | yes | yes | no | no | no |
-| `tunnel.ashx` | C#/ASHX | yes | yes | no | no | no |
+| `tunnel.go` | Go | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `tunnel.js` | Node.js | ✅ | ✅ | ✅ | ✅ | ❌ |
+| `tunnel.jsp` | Java/JSP | ✅ | ✅ | ✅ | ❌ | ❌ |
+| `tunnel.jspx` | Java/JSPX | ✅ | ✅ | ✅ | ❌ | ❌ |
+| `tunnel.php` | PHP | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `tunnel.aspx` | C#/ASPX | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `tunnel.ashx` | C#/ASHX | ✅ | ✅ | ❌ | ❌ | ❌ |
 
 Example:
 
@@ -236,6 +269,14 @@ For PHP and Node.js deployments, `--async-connect` can help in environments wher
 ```bash
 ./roger-go -k password -u https://example.com/tunnel.php --async-connect
 ```
+
+## TODO
+
+- Better UI (TUI)
+- [Mythic's Arachne](https://github.com/MythicAgents/arachne) Integration
+- Obfuscation
+- More flexible artifacts (Memory Shell, Ghost Shell, PHP reflective loading + JSP/JSPX/ASHX/ASPX/.php)
+- Configurable traffic routing
 
 ## References
 
