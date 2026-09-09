@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net/http"
@@ -14,11 +15,22 @@ import (
 )
 
 func (c *client) askRoger() error {
-	req, err := c.newRequest(http.MethodGet, c.cfg.urls[0], nil)
+	method := http.MethodGet
+	var requestBody io.Reader
+	if len(c.cfg.redirectURLs) > 0 {
+		info := map[string][]byte{}
+		c.addRedirect(info)
+		method = http.MethodPost
+		requestBody = strings.NewReader(c.wrapRequestBody(c.codec.encodeBody(info)))
+	}
+	req, err := c.newRequest(method, c.cfg.urls[0], requestBody)
 	if err != nil {
 		return err
 	}
 	req.Header = cloneHeader(c.headers)
+	if requestBody != nil {
+		req.Header.Set("Content-Type", "application/octet-stream")
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
@@ -26,6 +38,9 @@ func (c *client) askRoger() error {
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		return err
+	}
+	if err := c.capturePHPSessionCookie(resp); err != nil {
 		return err
 	}
 	body = bytes.TrimSpace(body)
@@ -40,15 +55,76 @@ func (c *client) askRoger() error {
 	return nil
 }
 
+func (c *client) capturePHPSessionCookie(resp *http.Response) error {
+	if c.cfg.phpSkipCookie || (!c.cfg.asyncConnect && !strings.Contains(strings.ToLower(c.cfg.urls[0]), ".php")) {
+		return nil
+	}
+
+	expires := resp.Header.Get("Expires")
+	if expires == "" {
+		return nil
+	}
+	expiresAt, err := http.ParseTime(expires)
+	if err != nil {
+		log.Printf("[Ask Roger] Expires has an invalid format: %s", expires)
+		return nil
+	}
+	if !expiresAt.Before(time.Now()) {
+		return nil
+	}
+
+	cookies := resp.Cookies()
+	values := make([]string, 0, len(cookies))
+	for _, cookie := range cookies {
+		if cookie.Name != "" {
+			values = append(values, cookie.Name+"="+cookie.Value)
+		}
+	}
+	if len(values) == 0 {
+		return fmt.Errorf("PHP session response expired without setting a cookie")
+	}
+
+	c.headers.Set("Cookie", strings.Join(values, "; "))
+	log.Printf("[Ask Roger] Retained %d PHP session cookie(s)", len(values))
+	return nil
+}
+
 func (c *client) negotiateMode() string {
+	if c.cfg.requestTemplate != "" {
+		log.Printf("[MODE] Request templates require classic mode; auto selected classic")
+		c.cfg.httpVersion = "1.1"
+		return "classic"
+	}
+	if len(c.cfg.redirectURLs) > 0 {
+		return "classic"
+	}
 	modes := []string{"classic"}
 	if rinfo, err := c.control(map[string][]byte{"CMD": []byte("CAPS"), "MARK": []byte("__roger_probe__caps")}, 5*time.Second); err == nil {
 		if string(rinfo["STATUS"]) == "OK" && len(rinfo["MODES"]) > 0 {
 			modes = strings.Split(string(rinfo["MODES"]), ",")
 		}
 	}
+	canonicalModes := make([]string, 0, len(modes))
+	for _, mode := range modes {
+		canonical := canonicalTransportMode(strings.TrimSpace(mode))
+		if canonical != "" && !containsMode(canonicalModes, canonical) {
+			canonicalModes = append(canonicalModes, canonical)
+		}
+	}
+	proxyIncompatible := make([]string, 0)
+	if c.cfg.proxy != "" {
+		for _, mode := range canonicalModes {
+			if !proxyCompatibleTransportMode(mode) {
+				proxyIncompatible = append(proxyIncompatible, mode)
+			}
+		}
+	}
+
 	for _, candidate := range []string{"h3", "h2", "full-duplex", "half-duplex", "classic"} {
 		if c.cfg.ntlmAuth != "" && (candidate == "h3" || candidate == "h2" || candidate == "full-duplex") {
+			continue
+		}
+		if c.cfg.proxy != "" && !proxyCompatibleTransportMode(candidate) {
 			continue
 		}
 		wireMode := protocolTransportMode(candidate)
@@ -62,6 +138,16 @@ func (c *client) negotiateMode() string {
 				c.cfg.httpVersion = "2"
 			} else if c.cfg.httpVersion == "auto" {
 				c.cfg.httpVersion = "1.1"
+			}
+			if c.cfg.proxy != "" {
+				excluded := "none"
+				if len(proxyIncompatible) > 0 {
+					excluded = strings.Join(proxyIncompatible, ", ")
+				}
+				log.Printf(
+					"[MODE] Server supports: %s; modes incompatible with --proxy: %s; selected highest-priority proxy-compatible mode: %s",
+					strings.Join(canonicalModes, ", "), excluded, candidate,
+				)
 			}
 			return candidate
 		}
@@ -83,6 +169,9 @@ func (c *client) modeSupported(mode string) bool {
 }
 
 func (c *client) probeMode(mode string) bool {
+	if len(c.cfg.redirectURLs) > 0 && mode != "classic" {
+		return false
+	}
 	if mode == "h3" {
 		if c.cfg.ntlmAuth != "" {
 			return false
@@ -114,6 +203,7 @@ func (c *client) probeMode(mode string) bool {
 }
 
 func (c *client) control(info map[string][]byte, timeout time.Duration) (map[string][]byte, error) {
+	c.addRedirect(info)
 	body := c.wrapRequestBody(c.codec.encodeBody(info))
 	req, err := c.newRequest(http.MethodPost, c.sampleURL(), strings.NewReader(body))
 	if err != nil {
@@ -135,6 +225,7 @@ func (c *client) control(info map[string][]byte, timeout time.Duration) (map[str
 }
 
 func (c *client) request(info map[string][]byte, timeout time.Duration) (map[string][]byte, error) {
+	c.addRedirect(info)
 	body := c.wrapRequestBody(c.codec.encodeBody(info))
 	req, err := c.newRequest(http.MethodPost, c.sampleURL(), strings.NewReader(body))
 	if err != nil {
@@ -160,6 +251,24 @@ func (c *client) sampleURL() string {
 		return c.cfg.urls[0]
 	}
 	return c.cfg.urls[mrand.Intn(len(c.cfg.urls))]
+}
+
+func (c *client) addRedirect(info map[string][]byte) {
+	if len(c.cfg.redirectURLs) == 0 {
+		return
+	}
+	index := 0
+	if mark := info["MARK"]; len(mark) > 0 {
+		hash := fnv.New32a()
+		_, _ = hash.Write(mark)
+		index = int(hash.Sum32() % uint32(len(c.cfg.redirectURLs)))
+	}
+	info["REDIRECTURL"] = []byte(c.cfg.redirectURLs[index])
+	if c.cfg.forceRedirect {
+		info["FORCEREDIRECT"] = []byte("TRUE")
+	} else {
+		info["FORCEREDIRECT"] = []byte("FALSE")
+	}
 }
 
 func (c *client) newRequest(method, url string, body io.Reader) (*http.Request, error) {

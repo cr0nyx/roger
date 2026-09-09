@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -184,7 +183,16 @@ func (s *session) setupUDP() error {
 	if err := s.setupRequest(info); err != nil {
 		return err
 	}
-	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	bindIP := net.IPv4(127, 0, 0, 1)
+	if localTCP, ok := s.local.LocalAddr().(*net.TCPAddr); ok {
+		if ip := localTCP.IP.To4(); ip != nil && !ip.IsUnspecified() {
+			bindIP = append(net.IP(nil), ip...)
+		}
+	}
+	if peerTCP, ok := s.local.RemoteAddr().(*net.TCPAddr); ok {
+		s.udpControlIP = append(net.IP(nil), peerTCP.IP...)
+	}
+	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: bindIP, Port: 0})
 	if err != nil {
 		return err
 	}
@@ -211,7 +219,7 @@ func (s *session) setupRequest(info map[string][]byte) error {
 }
 
 func (s *session) isAsyncSetup() bool {
-	return s.client.cfg.asyncConnect || strings.Contains(s.client.cfg.urls[0], ".php")
+	return !s.client.cfg.syncConnect && (s.client.cfg.asyncConnect || strings.Contains(s.client.cfg.urls[0], ".php"))
 }
 
 func (s *session) waitBindPeer() (string, int, error) {
@@ -327,6 +335,7 @@ func (s *session) halfDownlinkReader() {
 		s.close()
 	}()
 	info := map[string][]byte{"CMD": []byte("DOWNLINK"), "MARK": []byte(s.mark)}
+	s.client.addRedirect(info)
 	body := s.client.codec.encodeBody(info)
 	req, err := s.client.newRequest(http.MethodPost, s.client.sampleURL(), strings.NewReader(body))
 	if err != nil {
@@ -379,16 +388,16 @@ func (s *session) handleDownlinkInfo(rinfo map[string][]byte) bool {
 			return true
 		}
 		data = out
-		if s.udpClient == nil {
+		udpClient := s.udpDestination()
+		if udpClient == nil {
 			return true
 		}
-		addr := append([]byte{0, 0, 0, 1}, net.ParseIP(string(rinfo["IP"])).To4()...)
-		pb := make([]byte, 2)
 		p, _ := strconv.Atoi(string(rinfo["PORT"]))
-		binary.BigEndian.PutUint16(pb, uint16(p))
-		packet := append(addr, pb...)
-		packet = append(packet, data...)
-		_, _ = s.udpConn.WriteToUDP(packet, s.udpClient)
+		packet, err := buildSocksUDPDatagram(string(rinfo["IP"]), p, data)
+		if err != nil {
+			return true
+		}
+		_, _ = s.udpConn.WriteToUDP(packet, udpClient)
 		s.recordTune(0, len(data), 0)
 		return true
 	}

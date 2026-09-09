@@ -845,6 +845,14 @@ public class GenericHandler1 : IHttpAsyncHandler {
 
         String rUrl = (String) info[REDIRECTURL];
         if (rUrl != null){
+            String redirectMode = (String)info[MODEOPT];
+            if (redirectMode != null && !redirectMode.Equals("classic", StringComparison.OrdinalIgnoreCase)) {
+                rinfo[STATUS] = "FAIL";
+                rinfo[ERROR] = "Redirection is supported in classic mode only";
+                context.Response.StatusCode = HTTPCODE;
+                context.Response.Write(Base64EncodeMapped(blv_encode(rinfo, "optimal", 1024)));
+                return;
+            }
             Uri u = new Uri(rUrl);
             WebRequest request = WebRequest.Create(u);
             request.Method = context.Request.HttpMethod;

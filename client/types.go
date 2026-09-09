@@ -110,15 +110,16 @@ type config struct {
 	socksUser          string
 	socksHash          string
 	proxy              string
+	skipTLSVerify      bool
 	cookie             string
 	forceRedirect      bool
 	redirectURLs       []string
 	requestTemplate    string
 	phpSkipCookie      bool
-	goServer           bool
+	syncConnect        bool
 	readInterval       time.Duration
 	writeInterval      time.Duration
-	maxThreads         int
+	maxConnections     int
 	maxRetry           int
 	cutLeft            int
 	cutRight           int
@@ -146,11 +147,12 @@ type codec struct {
 }
 
 type client struct {
-	cfg        *config
-	codec      *codec
-	httpClient *http.Client
-	headers    http.Header
-	serverVer  string
+	cfg             *config
+	codec           *codec
+	httpClient      *http.Client
+	headers         http.Header
+	serverVer       string
+	connectionSlots chan struct{}
 }
 
 type session struct {
@@ -168,6 +170,8 @@ type session struct {
 	remoteEOF    bool
 	udpConn      *net.UDPConn
 	udpClient    *net.UDPAddr
+	udpControlIP net.IP
+	udpMu        sync.Mutex
 	udpReasm     map[uint32]*udpReasmEntry
 	lastUDPUse   time.Time
 	activeMode   string

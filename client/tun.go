@@ -53,12 +53,17 @@ func (c *client) runTunMode() error {
 
 func (c *client) serveInternalSocks(ln net.Listener) {
 	for {
+		c.acquireConnection()
 		conn, err := ln.Accept()
 		if err != nil {
+			c.releaseConnection()
 			log.Printf("[TUN] internal SOCKS5 accept: %v", err)
 			return
 		}
-		go c.handleLocal(conn)
+		go func(local net.Conn) {
+			defer c.releaseConnection()
+			c.handleLocal(local)
+		}(conn)
 	}
 }
 

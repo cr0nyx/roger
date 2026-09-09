@@ -2,12 +2,19 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"hash/crc32"
 	"log"
 	"net"
 	"strconv"
 	"time"
 )
+
+type socksUDPDatagram struct {
+	host    string
+	port    int
+	payload []byte
+}
 
 func (s *session) udpWriter() {
 	defer s.close()
@@ -21,32 +28,19 @@ func (s *session) udpWriter() {
 			}
 			continue
 		}
-		if n < 10 {
+		datagram, err := parseSocksUDPDatagram(buf[:n])
+		if err != nil {
+			log.Printf("[UDP] dropping malformed SOCKS5 UDP packet: %v", err)
 			continue
 		}
-		s.udpClient = addr
+		if !s.acceptUDPSource(addr) {
+			log.Printf("[UDP] dropping packet from non-client address %s", addr.String())
+			continue
+		}
 		s.lastUDPUse = time.Now()
-		atyp := buf[3]
-		offset := 4
-		var host string
-		switch atyp {
-		case 1:
-			host = net.IP(buf[offset : offset+4]).String()
-			offset += 4
-		case 3:
-			l := int(buf[offset])
-			offset++
-			host = string(buf[offset : offset+l])
-			offset += l
-		default:
-			continue
-		}
-		port := int(binary.BigEndian.Uint16(buf[offset : offset+2]))
-		offset += 2
-		payload := append([]byte(nil), buf[offset:n]...)
-		fragments := fragmentUDP(payload, s.client.cfg.udpFragSize)
+		fragments := fragmentUDP(datagram.payload, s.client.cfg.udpFragSize)
 		for idx, frag := range fragments {
-			info := map[string][]byte{"CMD": []byte("FORWARD"), "MARK": []byte(s.mark), "IP": []byte(host), "PORT": []byte(strconv.Itoa(port)), "DATA": frag.data}
+			info := map[string][]byte{"CMD": []byte("FORWARD"), "MARK": []byte(s.mark), "IP": []byte(datagram.host), "PORT": []byte(strconv.Itoa(datagram.port)), "DATA": frag.data}
 			if frag.meta != nil {
 				info["UDPFRAG"] = frag.meta
 			}
@@ -54,7 +48,112 @@ func (s *session) udpWriter() {
 				return
 			}
 		}
-		s.recordTune(len(payload), 0, 0)
+		s.recordTune(len(datagram.payload), 0, 0)
+	}
+}
+
+func parseSocksUDPDatagram(packet []byte) (socksUDPDatagram, error) {
+	if len(packet) < 4 {
+		return socksUDPDatagram{}, errors.New("packet is shorter than SOCKS5 UDP header")
+	}
+	if packet[0] != 0 || packet[1] != 0 {
+		return socksUDPDatagram{}, errors.New("invalid SOCKS5 UDP RSV field")
+	}
+	if packet[2] != 0 {
+		return socksUDPDatagram{}, errors.New("SOCKS5 UDP fragmentation is not supported")
+	}
+	offset := 4
+	var host string
+	switch packet[3] {
+	case 1:
+		if len(packet) < offset+4+2 {
+			return socksUDPDatagram{}, errors.New("truncated SOCKS5 UDP IPv4 address")
+		}
+		host = net.IP(packet[offset : offset+4]).String()
+		offset += 4
+	case 3:
+		if len(packet) < offset+1 {
+			return socksUDPDatagram{}, errors.New("truncated SOCKS5 UDP domain length")
+		}
+		l := int(packet[offset])
+		offset++
+		if l == 0 || len(packet) < offset+l+2 {
+			return socksUDPDatagram{}, errors.New("truncated SOCKS5 UDP domain address")
+		}
+		host = string(packet[offset : offset+l])
+		offset += l
+	case 4:
+		if len(packet) < offset+16+2 {
+			return socksUDPDatagram{}, errors.New("truncated SOCKS5 UDP IPv6 address")
+		}
+		host = net.IP(packet[offset : offset+16]).String()
+		offset += 16
+	default:
+		return socksUDPDatagram{}, errors.New("unsupported SOCKS5 UDP ATYP")
+	}
+	port := int(binary.BigEndian.Uint16(packet[offset : offset+2]))
+	offset += 2
+	return socksUDPDatagram{host: host, port: port, payload: append([]byte(nil), packet[offset:]...)}, nil
+}
+
+func buildSocksUDPDatagram(host string, port int, data []byte) ([]byte, error) {
+	if port < 0 || port > 65535 {
+		return nil, errors.New("SOCKS5 UDP port is out of range")
+	}
+	out := []byte{0, 0, 0}
+	ip := net.ParseIP(host)
+	if ip4 := ip.To4(); ip4 != nil {
+		out = append(out, 1)
+		out = append(out, ip4...)
+	} else if ip16 := ip.To16(); ip16 != nil {
+		out = append(out, 4)
+		out = append(out, ip16...)
+	} else {
+		if len(host) == 0 || len(host) > 255 {
+			return nil, errors.New("SOCKS5 UDP domain address is too long")
+		}
+		out = append(out, 3, byte(len(host)))
+		out = append(out, []byte(host)...)
+	}
+	pb := make([]byte, 2)
+	binary.BigEndian.PutUint16(pb, uint16(port))
+	out = append(out, pb...)
+	out = append(out, data...)
+	return out, nil
+}
+
+func (s *session) acceptUDPSource(addr *net.UDPAddr) bool {
+	if addr == nil {
+		return false
+	}
+	if s.udpControlIP != nil && !s.udpControlIP.Equal(addr.IP) {
+		return false
+	}
+	s.udpMu.Lock()
+	defer s.udpMu.Unlock()
+	if s.udpClient == nil {
+		s.udpClient = &net.UDPAddr{IP: append(net.IP(nil), addr.IP...), Port: addr.Port, Zone: addr.Zone}
+		return true
+	}
+	return s.udpClient.Port == addr.Port && s.udpClient.IP.Equal(addr.IP) && s.udpClient.Zone == addr.Zone
+}
+
+func (s *session) udpDestination() *net.UDPAddr {
+	s.udpMu.Lock()
+	defer s.udpMu.Unlock()
+	if s.udpClient == nil {
+		return nil
+	}
+	return &net.UDPAddr{IP: append(net.IP(nil), s.udpClient.IP...), Port: s.udpClient.Port, Zone: s.udpClient.Zone}
+}
+
+func (s *session) watchUDPControl() {
+	buf := make([]byte, 1)
+	for {
+		if _, err := s.local.Read(buf); err != nil {
+			s.close()
+			return
+		}
 	}
 }
 

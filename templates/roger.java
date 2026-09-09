@@ -84,6 +84,24 @@ public class roger implements HostnameVerifier, X509TrustManager, Runnable {
         return updated;
     }
 
+    public void closeSession(String mark) {
+        Object sessionObject = sessions.remove(mark);
+        try {
+            if (sessionObject instanceof java.util.Map) {
+                Object channel = ((java.util.Map)sessionObject).get("channel");
+                if (channel instanceof Channel) {
+                    ((Channel)channel).close();
+                }
+            } else if (sessionObject instanceof Channel) {
+                ((Channel)sessionObject).close();
+            }
+        } catch (Exception e) {
+        }
+        settings.remove(mark);
+        remoteWriteClosed.remove(mark);
+        remoteWriteNotified.remove(mark);
+    }
+
     public boolean fillDownlinkFrame(Object[] rinfo, String mark, int DATA, int CMD, int STATUS, int ERROR, int IP, int PORT, int UDPFRAG, int READBUF, int MAXREADSIZE, int UDPFRAGSIZE, int UDP_IDLE_TIMEOUT, boolean HALF_CLOSE_MODE, int UDPMAXSIZE) {
         Object channel = sessions.get(mark);
         Object[] sessionSettings = getSettings(mark, READBUF, MAXREADSIZE, UDPFRAGSIZE, UDP_IDLE_TIMEOUT, HALF_CLOSE_MODE);
@@ -412,28 +430,32 @@ public class roger implements HostnameVerifier, X509TrustManager, Runnable {
         }
         final Object[] responseSettings = getSettings(mark, READBUF, MAXREADSIZE, UDPFRAGSIZE, UDP_IDLE_TIMEOUT, HALF_CLOSE_MODE);
 
-        Thread uplink = new Thread(this);
-        threadArgs.put(uplink, new Object[]{in, mark, new Integer(DATA), new Integer(CMD), new Integer(IP), new Integer(PORT), new Integer(UDPFRAG), new Integer(UDPMAXSIZE), new Integer(BLV_L_OFFSET)});
-        uplink.setDaemon(true);
-        uplink.start();
+        try {
+            Thread uplink = new Thread(this);
+            threadArgs.put(uplink, new Object[]{in, mark, new Integer(DATA), new Integer(CMD), new Integer(IP), new Integer(PORT), new Integer(UDPFRAG), new Integer(UDPMAXSIZE), new Integer(BLV_L_OFFSET)});
+            uplink.setDaemon(true);
+            uplink.start();
 
-        long lastHeartbeat = System.currentTimeMillis();
-        long heartbeatInterval = 5000L;
-        while (true) {
-            Object[] frameInfo = new Object[40];
-            boolean closeAfterWrite = fillDownlinkFrame(frameInfo, mark, DATA, CMD, STATUS, ERROR, IP, PORT, UDPFRAG, READBUF, MAXREADSIZE, UDPFRAGSIZE, UDP_IDLE_TIMEOUT, HALF_CLOSE_MODE, UDPMAXSIZE);
-            if ("HEARTBEAT".equals(frameInfo[CMD]) && System.currentTimeMillis() - lastHeartbeat < heartbeatInterval) {
+            long lastHeartbeat = System.currentTimeMillis();
+            long heartbeatInterval = 5000L;
+            while (true) {
+                Object[] frameInfo = new Object[40];
+                boolean closeAfterWrite = fillDownlinkFrame(frameInfo, mark, DATA, CMD, STATUS, ERROR, IP, PORT, UDPFRAG, READBUF, MAXREADSIZE, UDPFRAGSIZE, UDP_IDLE_TIMEOUT, HALF_CLOSE_MODE, UDPMAXSIZE);
+                if ("HEARTBEAT".equals(frameInfo[CMD]) && System.currentTimeMillis() - lastHeartbeat < heartbeatInterval) {
+                    Thread.sleep(50);
+                    continue;
+                }
+                writeStreamFrame(out, frameInfo, new Integer(BLV_L_OFFSET), (String)responseSettings[4], ((Integer)responseSettings[5]).intValue());
+                if ("HEARTBEAT".equals(frameInfo[CMD])) {
+                    lastHeartbeat = System.currentTimeMillis();
+                }
+                if (closeAfterWrite) {
+                    break;
+                }
                 Thread.sleep(50);
-                continue;
             }
-            writeStreamFrame(out, frameInfo, new Integer(BLV_L_OFFSET), (String)responseSettings[4], ((Integer)responseSettings[5]).intValue());
-            if ("HEARTBEAT".equals(frameInfo[CMD])) {
-                lastHeartbeat = System.currentTimeMillis();
-            }
-            if (closeAfterWrite) {
-                break;
-            }
-            Thread.sleep(50);
+        } finally {
+            closeSession(mark);
         }
     }
 
@@ -557,6 +579,7 @@ public class roger implements HostnameVerifier, X509TrustManager, Runnable {
             int CLIENTLIMITOPT = 18;
             int SERVERLIMITOPT = 19;
             int UDPTIMEOUTOPT = 20;
+            int MODEOPT        = 21;
             int MODES         = 22;
 
 
@@ -603,6 +626,16 @@ public class roger implements HostnameVerifier, X509TrustManager, Runnable {
             String rUrl = (String) info[REDIRECTURL];
 
             if (rUrl != null) {
+                String redirectMode = (String) info[MODEOPT];
+                if (redirectMode != null && !redirectMode.equalsIgnoreCase("classic")) {
+                    rinfo[STATUS] = "FAIL";
+                    rinfo[ERROR] = "Redirection is supported in classic mode only";
+                    invokeMethod(response, "setStatus", new Object[]{HTTPCODE});
+                    out.write(b64en(blv_encode(rinfo, BLV_L_OFFSET, "optimal", 1024)));
+                    out.flush();
+                    out.close();
+                    return false;
+                }
                 String force = (String) info[FORCEREDIRECT];
                 if (force.compareTo("TRUE") == 0 || !islocal(rUrl)){
                     info[REDIRECTURL] = null;
@@ -729,23 +762,38 @@ public class roger implements HostnameVerifier, X509TrustManager, Runnable {
                         String bndAddr = (String) info[IP];
                         String bndPort = (String) info[PORT];
                         ServerSocketChannel serverChannel = ServerSocketChannel.open();
-                        serverChannel.configureBlocking(true);
+                        serverChannel.configureBlocking(false);
                         serverChannel.bind(new InetSocketAddress(bndAddr, Integer.parseInt(bndPort)));
+                        InetSocketAddress localAddress = (InetSocketAddress)serverChannel.getLocalAddress();
                         rinfo[STATUS] = "OK";
-                        rinfo[IP] = bndAddr;
-                        rinfo[PORT] = bndPort;
+                        rinfo[IP] = localAddress.getAddress().getHostAddress();
+                        rinfo[PORT] = String.valueOf(localAddress.getPort());
                         settings.put(mark, sessionSettings);
                         sessions.put(mark, serverChannel);
                         new Thread(() -> {
                             try {
-                                SocketChannel clientChannel = serverChannel.accept();
-                                clientChannel.configureBlocking(false);
-                                sessions.put(mark, clientChannel);
-                                remoteWriteClosed.put(mark, Boolean.FALSE);
-                                remoteWriteNotified.remove(mark);
-                                //clientSocket.close();
-                                serverChannel.close();
+                                while (true) {
+                                    if (sessions.get(mark) != serverChannel) {
+                                        return;
+                                    }
+                                    SocketChannel clientChannel = serverChannel.accept();
+                                    if (clientChannel == null) {
+                                        try { Thread.sleep(200); } catch (InterruptedException ie) { return; }
+                                        continue;
+                                    }
+                                    clientChannel.configureBlocking(false);
+                                    if (sessions.replace(mark, serverChannel, clientChannel)) {
+                                        remoteWriteClosed.put(mark, Boolean.FALSE);
+                                        remoteWriteNotified.remove(mark);
+                                    } else {
+                                        try { clientChannel.close(); } catch (Exception ignored) {}
+                                    }
+                                    serverChannel.close();
+                                    return;
+                                }
                             } catch (Exception e) {
+                            } finally {
+                                try { serverChannel.close(); } catch (Exception e) {}
                             }
                         }).start();
                     } catch (Exception e) {

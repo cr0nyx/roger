@@ -113,7 +113,11 @@ func (s *session) handleSocks5() error {
 			return err
 		}
 		addr := s.udpConn.LocalAddr().(*net.UDPAddr)
-		return s.socksReply(socksOK, net.IPv4(0, 0, 0, 0), addr.Port)
+		if err := s.socksReply(socksOK, addr.IP.To4(), addr.Port); err != nil {
+			return err
+		}
+		go s.watchUDPControl()
+		return nil
 	default:
 		return errors.New("unsupported SOCKS5 command")
 	}

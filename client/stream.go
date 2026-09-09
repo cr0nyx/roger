@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -48,7 +49,12 @@ func (c *client) streamHTTPConnection() (net.Conn, *bufio.Reader, error) {
 		return nil, nil, err
 	}
 	if u.Scheme == "https" {
-		conn = tls.Client(conn, &tls.Config{InsecureSkipVerify: true, ServerName: host})
+		tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: c.cfg.skipTLSVerify, ServerName: host})
+		if err := tlsConn.Handshake(); err != nil {
+			_ = conn.Close()
+			return nil, nil, fmt.Errorf("TLS handshake or certificate verification failed: %w", err)
+		}
+		conn = tlsConn
 	}
 
 	headers := cloneHeader(c.headers)
@@ -296,10 +302,15 @@ func (c *client) probeFullDuplexMode() bool {
 
 func (c *client) probeHTTP2StreamMode() bool {
 	pr, pw := io.Pipe()
+	defer pr.Close()
+	defer pw.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	req, err := c.newRequest(http.MethodPost, c.sampleURL(), pr)
 	if err != nil {
 		return false
 	}
+	req = req.WithContext(ctx)
 	req.Header = cloneHeader(c.headers)
 	req.Header.Set("Content-Type", "application/octet-stream")
 	respCh := make(chan *http.Response, 1)
@@ -307,10 +318,17 @@ func (c *client) probeHTTP2StreamMode() bool {
 	go func() {
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
-			errCh <- err
+			select {
+			case errCh <- err:
+			case <-ctx.Done():
+			}
 			return
 		}
-		respCh <- resp
+		select {
+		case respCh <- resp:
+		case <-ctx.Done():
+			_ = resp.Body.Close()
+		}
 	}()
 	frame := c.codec.encodeStreamFrame(map[string][]byte{"CMD": []byte("PROBE"), "MARK": []byte("__roger_probe__h2_go"), "MODE": []byte("h2")})
 	if _, err := pw.Write(frame); err != nil {
@@ -336,36 +354,50 @@ func (c *client) probeHTTP2StreamMode() bool {
 	}
 }
 
-func (c *client) h3Client() *http.Client {
-	return &http.Client{
-		Timeout: 0,
-		Transport: &http3.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-				NextProtos:         []string{"h3"},
-			},
+func (c *client) h3Client() (*http.Client, *http3.Transport) {
+	transport := &http3.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: c.cfg.skipTLSVerify,
+			NextProtos:         []string{"h3"},
 		},
 	}
+	return &http.Client{
+		Timeout:   0,
+		Transport: transport,
+	}, transport
 }
 
 func (c *client) probeHTTP3StreamMode() bool {
 	pr, pw := io.Pipe()
+	defer pr.Close()
+	defer pw.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	req, err := c.newRequest(http.MethodPost, c.sampleURL(), pr)
 	if err != nil {
 		return false
 	}
+	req = req.WithContext(ctx)
 	req.Header = cloneHeader(c.headers)
 	req.Header.Set("Content-Type", "application/octet-stream")
 	respCh := make(chan *http.Response, 1)
 	errCh := make(chan error, 1)
-	h3Client := c.h3Client()
+	h3Client, h3Transport := c.h3Client()
+	defer h3Transport.Close()
 	go func() {
 		resp, err := h3Client.Do(req)
 		if err != nil {
-			errCh <- err
+			select {
+			case errCh <- err:
+			case <-ctx.Done():
+			}
 			return
 		}
-		respCh <- resp
+		select {
+		case respCh <- resp:
+		case <-ctx.Done():
+			_ = resp.Body.Close()
+		}
 	}()
 	frame := c.codec.encodeStreamFrame(map[string][]byte{"CMD": []byte("PROBE"), "MARK": []byte("__roger_probe__h3_go"), "MODE": []byte("h3")})
 	if _, err := pw.Write(frame); err != nil {
@@ -465,35 +497,22 @@ func (s *session) fullDuplexUDPUpload(conn net.Conn, sendMu *sync.Mutex) {
 			}
 			continue
 		}
-		if n < 10 {
+		datagram, err := parseSocksUDPDatagram(buf[:n])
+		if err != nil {
+			log.Printf("[UDP] dropping malformed SOCKS5 UDP packet: %v", err)
 			continue
 		}
-		s.udpClient = addr
+		if !s.acceptUDPSource(addr) {
+			log.Printf("[UDP] dropping packet from non-client address %s", addr.String())
+			continue
+		}
 		s.lastUDPUse = time.Now()
-		atyp := buf[3]
-		offset := 4
-		var host string
-		switch atyp {
-		case 1:
-			host = net.IP(buf[offset : offset+4]).String()
-			offset += 4
-		case 3:
-			l := int(buf[offset])
-			offset++
-			host = string(buf[offset : offset+l])
-			offset += l
-		default:
-			continue
-		}
-		port := int(binaryBigEndianUint16(buf[offset : offset+2]))
-		offset += 2
-		payload := append([]byte(nil), buf[offset:n]...)
-		for _, frag := range fragmentUDP(payload, s.client.cfg.udpFragSize) {
+		for _, frag := range fragmentUDP(datagram.payload, s.client.cfg.udpFragSize) {
 			info := map[string][]byte{
 				"CMD":  []byte("DATA"),
 				"MARK": []byte(s.mark),
-				"IP":   []byte(host),
-				"PORT": []byte(strconv.Itoa(port)),
+				"IP":   []byte(datagram.host),
+				"PORT": []byte(strconv.Itoa(datagram.port)),
 				"DATA": frag.data,
 			}
 			if frag.meta != nil {
@@ -504,8 +523,8 @@ func (s *session) fullDuplexUDPUpload(conn net.Conn, sendMu *sync.Mutex) {
 			}
 		}
 		s.requestCount++
-		s.recordTune(len(payload), 0, 0)
-		log.Printf("[%s:%d] [%s] No.%d >>>> [%d byte]", s.target, s.port, s.mark, s.requestCount, len(payload))
+		s.recordTune(len(datagram.payload), 0, 0)
+		log.Printf("[%s:%d] [%s] No.%d >>>> [%d byte]", s.target, s.port, s.mark, s.requestCount, len(datagram.payload))
 	}
 }
 
@@ -579,35 +598,22 @@ func (s *session) http2StreamUDPUpload(w io.Writer, sendMu *sync.Mutex) {
 			}
 			continue
 		}
-		if n < 10 {
+		datagram, err := parseSocksUDPDatagram(buf[:n])
+		if err != nil {
+			log.Printf("[UDP] dropping malformed SOCKS5 UDP packet: %v", err)
 			continue
 		}
-		s.udpClient = addr
+		if !s.acceptUDPSource(addr) {
+			log.Printf("[UDP] dropping packet from non-client address %s", addr.String())
+			continue
+		}
 		s.lastUDPUse = time.Now()
-		atyp := buf[3]
-		offset := 4
-		var host string
-		switch atyp {
-		case 1:
-			host = net.IP(buf[offset : offset+4]).String()
-			offset += 4
-		case 3:
-			l := int(buf[offset])
-			offset++
-			host = string(buf[offset : offset+l])
-			offset += l
-		default:
-			continue
-		}
-		port := int(binaryBigEndianUint16(buf[offset : offset+2]))
-		offset += 2
-		payload := append([]byte(nil), buf[offset:n]...)
-		for _, frag := range fragmentUDP(payload, s.client.cfg.udpFragSize) {
+		for _, frag := range fragmentUDP(datagram.payload, s.client.cfg.udpFragSize) {
 			info := map[string][]byte{
 				"CMD":  []byte("DATA"),
 				"MARK": []byte(s.mark),
-				"IP":   []byte(host),
-				"PORT": []byte(strconv.Itoa(port)),
+				"IP":   []byte(datagram.host),
+				"PORT": []byte(strconv.Itoa(datagram.port)),
 				"DATA": frag.data,
 			}
 			if frag.meta != nil {
@@ -618,13 +624,9 @@ func (s *session) http2StreamUDPUpload(w io.Writer, sendMu *sync.Mutex) {
 			}
 		}
 		s.requestCount++
-		s.recordTune(len(payload), 0, 0)
-		log.Printf("[%s:%d] [%s] No.%d >>>> [%d byte]", s.target, s.port, s.mark, s.requestCount, len(payload))
+		s.recordTune(len(datagram.payload), 0, 0)
+		log.Printf("[%s:%d] [%s] No.%d >>>> [%d byte]", s.target, s.port, s.mark, s.requestCount, len(datagram.payload))
 	}
-}
-
-func binaryBigEndianUint16(data []byte) uint16 {
-	return uint16(data[0])<<8 | uint16(data[1])
 }
 
 func (s *session) fullDuplexExchange() bool {
@@ -692,12 +694,17 @@ func (s *session) fullDuplexExchange() bool {
 
 func (s *session) http2StreamExchange() bool {
 	pr, pw := io.Pipe()
+	defer pr.Close()
+	defer pw.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	req, err := s.client.newRequest(http.MethodPost, s.client.sampleURL(), pr)
 	if err != nil {
 		log.Printf("[H2] %v", err)
 		s.close()
 		return false
 	}
+	req = req.WithContext(ctx)
 	req.Header = cloneHeader(s.client.headers)
 	req.Header.Set("Content-Type", "application/octet-stream")
 
@@ -706,10 +713,17 @@ func (s *session) http2StreamExchange() bool {
 	go func() {
 		resp, err := s.client.httpClient.Do(req)
 		if err != nil {
-			errCh <- err
+			select {
+			case errCh <- err:
+			case <-ctx.Done():
+			}
 			return
 		}
-		respCh <- resp
+		select {
+		case respCh <- resp:
+		case <-ctx.Done():
+			_ = resp.Body.Close()
+		}
 	}()
 
 	sendMu := &sync.Mutex{}
@@ -791,25 +805,38 @@ func (s *session) http2StreamExchange() bool {
 
 func (s *session) http3StreamExchange() bool {
 	pr, pw := io.Pipe()
+	defer pr.Close()
+	defer pw.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	req, err := s.client.newRequest(http.MethodPost, s.client.sampleURL(), pr)
 	if err != nil {
 		log.Printf("[H3] %v", err)
 		s.close()
 		return false
 	}
+	req = req.WithContext(ctx)
 	req.Header = cloneHeader(s.client.headers)
 	req.Header.Set("Content-Type", "application/octet-stream")
 
-	h3Client := s.client.h3Client()
+	h3Client, h3Transport := s.client.h3Client()
+	defer h3Transport.Close()
 	respCh := make(chan *http.Response, 1)
 	errCh := make(chan error, 1)
 	go func() {
 		resp, err := h3Client.Do(req)
 		if err != nil {
-			errCh <- err
+			select {
+			case errCh <- err:
+			case <-ctx.Done():
+			}
 			return
 		}
-		respCh <- resp
+		select {
+		case respCh <- resp:
+		case <-ctx.Done():
+			_ = resp.Body.Close()
+		}
 	}()
 
 	sendMu := &sync.Mutex{}

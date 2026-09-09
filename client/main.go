@@ -41,7 +41,7 @@ func main() {
 		proxyFunc = http.ProxyURL(proxyURL)
 	}
 	transport := &http.Transport{
-		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: cfg.skipTLSVerify},
 		Proxy:             proxyFunc,
 		ForceAttemptHTTP2: cfg.httpVersion != "1.1" && cfg.ntlmAuth == "",
 		TLSNextProto:      tlsNextProto(cfg.httpVersion),
@@ -51,8 +51,9 @@ func main() {
 		roundTripper = ntlmssp.Negotiator{RoundTripper: transport}
 	}
 	cl := &client{
-		cfg:   cfg,
-		codec: cdc,
+		cfg:             cfg,
+		codec:           cdc,
+		connectionSlots: make(chan struct{}, cfg.maxConnections),
 		httpClient: &http.Client{
 			Timeout:   0,
 			Transport: roundTripper,
@@ -77,7 +78,9 @@ func main() {
 
 	if cfg.mode == "auto" {
 		cfg.mode = cl.negotiateMode()
-		log.Printf("[MODE] Auto selected %s", cfg.mode)
+		if cfg.proxy == "" {
+			log.Printf("[MODE] Auto selected %s", cfg.mode)
+		}
 	}
 
 	if cfg.tunName != "" {
@@ -90,7 +93,12 @@ func main() {
 	if cfg.remote {
 		log.Printf("[REMOTE FWD] Server listening on %s:%d => local %s", cfg.listen, cfg.port, cfg.target)
 		for {
-			if err := cl.handleRemoteForward(); err != nil {
+			cl.acquireConnection()
+			err := func() error {
+				defer cl.releaseConnection()
+				return cl.handleRemoteForward()
+			}()
+			if err != nil {
 				log.Printf("[REMOTE FWD] %v", err)
 				time.Sleep(cfg.readInterval)
 				continue
@@ -112,13 +120,26 @@ func main() {
 		}
 	}
 	for {
+		cl.acquireConnection()
 		conn, err := ln.Accept()
 		if err != nil {
+			cl.releaseConnection()
 			log.Printf("[SOCKS5] accept: %v", err)
 			continue
 		}
-		go cl.handleLocal(conn)
+		go func(local net.Conn) {
+			defer cl.releaseConnection()
+			cl.handleLocal(local)
+		}(conn)
 	}
+}
+
+func (c *client) acquireConnection() {
+	c.connectionSlots <- struct{}{}
+}
+
+func (c *client) releaseConnection() {
+	<-c.connectionSlots
 }
 
 func tlsNextProto(httpVersion string) map[string]func(string, *tls.Conn) http.RoundTripper {

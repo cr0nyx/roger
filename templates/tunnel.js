@@ -5,6 +5,7 @@
   const https = await import('node:https');
   const net = await import('node:net');
   const dgram = await import('node:dgram');
+  const os = await import('node:os');
   const zlib = await import('node:zlib');
 
   const DATA = 1;
@@ -205,6 +206,75 @@
   function sendHello(res) {
     const translated = strtr("Roger says, 'All seems fine'", de, en);
     res.end(Buffer.from(translated, 'base64').toString());
+  }
+
+  function redirectModeAllowed(info) {
+    const mode = info[MODEOPT] ? info[MODEOPT].toString().trim().toLowerCase() : '';
+    return mode === '' || mode === 'classic';
+  }
+
+  function relayClassicRequest(req, res, info, requestDataHead, requestDataTail) {
+    if (!info[REDIRECTURL]) {
+      return false;
+    }
+    if (!redirectModeAllowed(info)) {
+      sendRoger(res, {
+        [STATUS]: 'FAIL',
+        [ERROR]: 'Redirection is supported in classic mode only',
+      });
+      return true;
+    }
+
+    let target;
+    try {
+      target = new URL(info[REDIRECTURL].toString());
+    } catch (error) {
+      sendRoger(res, { [STATUS]: 'FAIL', [ERROR]: error.message });
+      return true;
+    }
+    const forceRedirect = info[FORCEREDIRECT] && info[FORCEREDIRECT].toString().toUpperCase() === 'TRUE';
+    const localAddresses = new Set(['127.0.0.1', '::1', req.socket.localAddress]);
+    for (const addresses of Object.values(os.networkInterfaces())) {
+      for (const address of addresses || []) {
+        localAddresses.add(address.address);
+      }
+    }
+    if (!forceRedirect && (target.hostname === 'localhost' || localAddresses.has(target.hostname))) {
+      return false;
+    }
+    delete info[REDIRECTURL];
+    delete info[FORCEREDIRECT];
+
+    const encoded = strtr(blv_encode(info, 'optimal', 1024).toString('base64'), en, de);
+    const body = Buffer.concat([
+      Buffer.from(requestDataHead),
+      Buffer.from(encoded),
+      Buffer.from(requestDataTail),
+    ]);
+    const headers = Object.assign({}, req.headers);
+    for (const name of ['connection', 'content-length', 'host', 'keep-alive', 'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'upgrade']) {
+      delete headers[name];
+    }
+    headers['content-length'] = String(body.length);
+
+    const transport = target.protocol === 'https:' ? https : http;
+    const relay = transport.request(target, { method: req.method, headers }, upstream => {
+      const responseHeaders = Object.assign({}, upstream.headers);
+      for (const name of ['connection', 'content-length', 'keep-alive', 'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'upgrade']) {
+        delete responseHeaders[name];
+      }
+      res.writeHead(upstream.statusCode || HTTPCODE, responseHeaders);
+      upstream.pipe(res);
+    });
+    relay.on('error', error => {
+      if (!res.headersSent) {
+        sendRoger(res, { [STATUS]: 'FAIL', [ERROR]: error.message });
+      } else {
+        res.end();
+      }
+    });
+    relay.end(body);
+    return true;
   }
 
   function defaultSettings() {
@@ -557,19 +627,27 @@
     let state = null;
     let streamReady = false;
     let closed = false;
+    let gracefulClose = false;
     let timer = null;
     let lastHeartbeat = Date.now();
     const heartbeatIntervalMs = 5000;
 
-    const closeStream = () => {
+    const closeStream = (abnormal = false) => {
+      if (closed) {
+        return;
+      }
       closed = true;
       if (timer) {
         clearInterval(timer);
         timer = null;
       }
+      if (abnormal && !gracefulClose && mark && state) {
+        closeState(mark, state);
+      }
     };
-    res.on('close', closeStream);
-    req.on('aborted', closeStream);
+    res.on('close', () => closeStream(!res.writableEnded));
+    req.on('aborted', () => closeStream(true));
+    res.on('error', () => closeStream(true));
 
     const startOutput = () => {
       if (streamReady || !state) {
@@ -583,6 +661,10 @@
         }
         const current = states.get(mark);
         if (!current || (!current.run && !hasBufferedData(current) && !current.remoteWriteClosed)) {
+          if (current) {
+            closeState(mark, current);
+          }
+          gracefulClose = true;
           closeStream();
           res.end();
           return;
@@ -649,6 +731,17 @@
         const info = decodeStreamFrame(payload);
         const cmd = info[CMD] ? info[CMD].toString() : '';
         if (!streamReady) {
+          if (info[REDIRECTURL]) {
+            state = { settings: defaultSettings() };
+            res.writeHead(200);
+            writeStreamFrame(res, state, {
+              [STATUS]: 'FAIL',
+              [ERROR]: 'Redirection is supported in classic mode only',
+            });
+            closeStream();
+            res.end();
+            return;
+          }
           if ((cmd !== 'DUPLEX' && cmd !== 'PROBE') || !info[MARK]) {
             closeStream();
             res.end();
@@ -660,6 +753,7 @@
             const frame = {};
             frame[STATUS] = 'OK';
             writeStreamFrame(res, state, frame);
+            gracefulClose = true;
             closeStream();
             res.end();
             return;
@@ -686,8 +780,21 @@
     consumeFrames();
   }
 
-  function handleClassicBody(res, body) {
-      const translated = strtr(body, de, en);
+  function handleClassicBody(req, res, body) {
+      let protocolBody = body;
+      let requestDataHead = '';
+      let requestDataTail = '';
+      if (USE_REQUEST_TEMPLATE === 1 && body.length > 0) {
+        if (body.length < START_INDEX + END_INDEX) {
+          res.writeHead(400);
+          res.end();
+          return;
+        }
+        requestDataHead = body.slice(0, START_INDEX);
+        requestDataTail = END_INDEX > 0 ? body.slice(body.length - END_INDEX) : '';
+        protocolBody = body.slice(START_INDEX, END_INDEX > 0 ? body.length - END_INDEX : undefined);
+      }
+      const translated = strtr(protocolBody, de, en);
       const decoded = Buffer.from(translated, 'base64');
       let info;
       try {
@@ -702,6 +809,10 @@
       const mark = info[MARK] ? info[MARK].toString() : null;
       const cmd = info[CMD] ? info[CMD].toString() : null;
       res._rogerMark = mark;
+
+      if (relayClassicRequest(req, res, info, requestDataHead, requestDataTail)) {
+        return;
+      }
 
       if (!cmd || !mark) {
         sendHello(res);
@@ -1143,7 +1254,7 @@
   function handleRequest(req, res, initialBody = '') {
     let body = initialBody;
     req.on('data', chunk => body += chunk.toString());
-    req.on('end', () => handleClassicBody(res, body));
+    req.on('end', () => handleClassicBody(req, res, body));
   }
 
   function handleProtocolRequest(req, res) {
@@ -1191,7 +1302,7 @@
     req.on('end', () => {
       if (!decided) {
         decided = true;
-        handleClassicBody(res, probeBuffer.toString());
+        handleClassicBody(req, res, probeBuffer.toString());
       }
     });
   }

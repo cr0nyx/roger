@@ -53,7 +53,8 @@ func parseFlags() *config {
 			{[]string{"-R", "--force-redirect"}, "force redirect", cfg.forceRedirect},
 			{[]string{"-c", "--cookie"}, "custom init cookies", cfg.cookie},
 			{[]string{"-x", "--proxy"}, "proxy URL", cfg.proxy},
-			{[]string{"-T", "--request-template"}, "HTTP request template string or file", cfg.requestTemplate},
+			{[]string{"--skip-tls-verify"}, "disable TLS certificate verification", cfg.skipTLSVerify},
+			{[]string{"-T", "--request-template"}, "Classic-mode HTTP request template string or file", cfg.requestTemplate},
 			{[]string{"--local-dns"}, "resolve domain names locally", cfg.localDNS},
 			{[]string{"--read-buff"}, "local read buffer in KB", readBufKB},
 			{[]string{"--max-read-size"}, "remote max read size in KB", maxReadSizeKB},
@@ -64,8 +65,8 @@ func parseFlags() *config {
 			{[]string{"--half-close"}, "enable TCP SHUT_WR half-close command", cfg.halfClose},
 			{[]string{"--auto-tune"}, "automatically tune READBUF and MAXREADSIZE during live sessions", cfg.autoTune},
 			{[]string{"-a", "--async-connect"}, "do not wait for CONNECT/BIND/UDP setup response", cfg.asyncConnect},
-			{[]string{"--php-skip-cookie"}, "skip cookie availability check in php", cfg.phpSkipCookie},
-			{[]string{"--go"}, "use go connection method", cfg.goServer},
+			{[]string{"--php-skip-cookie"}, "skip PHP session-cookie discovery", cfg.phpSkipCookie},
+			{[]string{"--sync-connect"}, "wait for synchronous session setup, including PHP URLs", cfg.syncConnect},
 			{[]string{"--php-connect-timeout"}, "async PHP setup timeout in seconds", phpConnectTimeoutSeconds},
 			{[]string{"--client-compression"}, "optimal, dynamic, or smart", cfg.clientCompression},
 			{[]string{"--server-compression"}, "optimal, dynamic, or smart", cfg.serverCompression},
@@ -73,7 +74,7 @@ func parseFlags() *config {
 			{[]string{"--server-optimal-limit"}, "server compression threshold", cfg.serverOptimalLimit},
 			{[]string{"--read-interval"}, "read interval in milliseconds", readIntervalMS},
 			{[]string{"--write-interval"}, "write interval in milliseconds", writeIntervalMS},
-			{[]string{"--max-threads"}, "max threads", cfg.maxThreads},
+			{[]string{"--max-connections"}, "maximum concurrent client sessions", cfg.maxConnections},
 			{[]string{"--max-retry"}, "max retry", cfg.maxRetry},
 			{[]string{"--cut-left"}, "truncate left side of response body", cfg.cutLeft},
 			{[]string{"--cut-right"}, "truncate right side of response body", cfg.cutRight},
@@ -112,8 +113,9 @@ func parseFlags() *config {
 	fs.StringVar(&cfg.cookie, "cookie", cfg.cookie, "custom init cookies")
 	fs.StringVar(&cfg.proxy, "x", cfg.proxy, "proxy URL")
 	fs.StringVar(&cfg.proxy, "proxy", cfg.proxy, "proxy URL")
-	fs.StringVar(&cfg.requestTemplate, "T", cfg.requestTemplate, "HTTP request template string or file")
-	fs.StringVar(&cfg.requestTemplate, "request-template", cfg.requestTemplate, "HTTP request template string or file")
+	fs.BoolVar(&cfg.skipTLSVerify, "skip-tls-verify", cfg.skipTLSVerify, "disable TLS certificate verification")
+	fs.StringVar(&cfg.requestTemplate, "T", cfg.requestTemplate, "classic-mode HTTP request template string or file")
+	fs.StringVar(&cfg.requestTemplate, "request-template", cfg.requestTemplate, "classic-mode HTTP request template string or file")
 	fs.BoolVar(&cfg.localDNS, "local-dns", cfg.localDNS, "resolve domain names locally")
 	fs.IntVar(&readBufKB, "read-buff", readBufKB, "local read buffer in KB")
 	fs.IntVar(&maxReadSizeKB, "max-read-size", maxReadSizeKB, "remote max read size in KB")
@@ -125,8 +127,8 @@ func parseFlags() *config {
 	fs.BoolVar(&cfg.autoTune, "auto-tune", cfg.autoTune, "automatically tune READBUF and MAXREADSIZE during live sessions")
 	fs.BoolVar(&cfg.asyncConnect, "a", cfg.asyncConnect, "do not wait for CONNECT/BIND/UDP setup response")
 	fs.BoolVar(&cfg.asyncConnect, "async-connect", cfg.asyncConnect, "do not wait for CONNECT/BIND/UDP setup response")
-	fs.BoolVar(&cfg.phpSkipCookie, "php-skip-cookie", cfg.phpSkipCookie, "skip cookie availability check in php")
-	fs.BoolVar(&cfg.goServer, "go", cfg.goServer, "use go connection method")
+	fs.BoolVar(&cfg.phpSkipCookie, "php-skip-cookie", cfg.phpSkipCookie, "skip PHP session-cookie discovery")
+	fs.BoolVar(&cfg.syncConnect, "sync-connect", cfg.syncConnect, "wait for synchronous session setup, including PHP URLs")
 	fs.Float64Var(&phpConnectTimeoutSeconds, "php-connect-timeout", phpConnectTimeoutSeconds, "async PHP setup timeout in seconds")
 	fs.StringVar(&cfg.clientCompression, "client-compression", cfg.clientCompression, "optimal, dynamic, or smart")
 	fs.StringVar(&cfg.serverCompression, "server-compression", cfg.serverCompression, "optimal, dynamic, or smart")
@@ -134,7 +136,7 @@ func parseFlags() *config {
 	fs.IntVar(&cfg.serverOptimalLimit, "server-optimal-limit", cfg.serverOptimalLimit, "server compression threshold")
 	fs.IntVar(&readIntervalMS, "read-interval", readIntervalMS, "read interval in milliseconds")
 	fs.IntVar(&writeIntervalMS, "write-interval", writeIntervalMS, "write interval in milliseconds")
-	fs.IntVar(&cfg.maxThreads, "max-threads", cfg.maxThreads, "max threads")
+	fs.IntVar(&cfg.maxConnections, "max-connections", cfg.maxConnections, "maximum concurrent client sessions")
 	fs.IntVar(&cfg.maxRetry, "max-retry", cfg.maxRetry, "max retry")
 	fs.IntVar(&cfg.cutLeft, "cut-left", cfg.cutLeft, "truncate left side of response body")
 	fs.IntVar(&cfg.cutRight, "cut-right", cfg.cutRight, "truncate right side of response body")
@@ -180,6 +182,18 @@ func parseFlags() *config {
 		fmt.Fprintf(os.Stderr, "invalid --mode %q: expected classic, half-duplex, full-duplex, h2, h3, or auto\n", cfg.mode)
 		os.Exit(2)
 	}
+	if cfg.maxConnections <= 0 {
+		fmt.Fprintln(os.Stderr, "--max-connections must be greater than zero")
+		os.Exit(2)
+	}
+	if len(cfg.redirectURLs) > 0 && cfg.mode != "classic" && cfg.mode != "auto" {
+		fmt.Fprintln(os.Stderr, "--redirect-url supports --mode classic or auto only; auto uses classic when redirection is enabled")
+		os.Exit(2)
+	}
+	if cfg.requestTemplate != "" && cfg.mode != "classic" && cfg.mode != "auto" {
+		fmt.Fprintln(os.Stderr, "--request-template supports --mode classic or auto only; auto uses classic when a request template is configured")
+		os.Exit(2)
+	}
 	cfg.httpVersion = "1.1"
 	if cfg.mode == "h2" {
 		cfg.httpVersion = "2"
@@ -191,6 +205,10 @@ func parseFlags() *config {
 	if cfg.proxy != "" {
 		if _, err := url.Parse(cfg.proxy); err != nil {
 			fmt.Fprintf(os.Stderr, "invalid --proxy: %v\n", err)
+			os.Exit(2)
+		}
+		if cfg.mode != "auto" && !proxyCompatibleTransportMode(cfg.mode) {
+			fmt.Fprintf(os.Stderr, "--mode %s cannot run with --proxy because this client transport would bypass the proxy\n", cfg.mode)
 			os.Exit(2)
 		}
 	}
@@ -282,7 +300,7 @@ func defaultConfig() *config {
 		autoTune:           false,
 		readInterval:       300 * time.Millisecond,
 		writeInterval:      200 * time.Millisecond,
-		maxThreads:         400,
+		maxConnections:     400,
 		maxRetry:           10,
 	}
 }
@@ -322,6 +340,26 @@ func protocolTransportMode(mode string) string {
 		return "full"
 	default:
 		return mode
+	}
+}
+
+func canonicalTransportMode(mode string) string {
+	switch mode {
+	case "half":
+		return "half-duplex"
+	case "full":
+		return "full-duplex"
+	default:
+		return mode
+	}
+}
+
+func proxyCompatibleTransportMode(mode string) bool {
+	switch canonicalTransportMode(mode) {
+	case "h2", "half-duplex", "classic":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -442,14 +480,16 @@ func applyConfigValue(cfg *config, key, value string) {
 		cfg.cookie = value
 	case "proxy":
 		cfg.proxy = value
+	case "skip_tls_verify":
+		cfg.skipTLSVerify = parseBool(value)
 	case "request_template":
 		cfg.requestTemplate = value
 	case "async_connect":
 		cfg.asyncConnect = parseBool(value)
 	case "php_skip_cookie":
 		cfg.phpSkipCookie = parseBool(value)
-	case "go":
-		cfg.goServer = parseBool(value)
+	case "sync_connect":
+		cfg.syncConnect = parseBool(value)
 	case "php_connect_timeout":
 		if seconds, err := strconv.ParseFloat(value, 64); err == nil {
 			cfg.phpConnectTimeout = time.Duration(seconds * float64(time.Second))
@@ -482,8 +522,8 @@ func applyConfigValue(cfg *config, key, value string) {
 		cfg.readInterval = time.Duration(atoiDefault(value, int(cfg.readInterval/time.Millisecond))) * time.Millisecond
 	case "write_interval":
 		cfg.writeInterval = time.Duration(atoiDefault(value, int(cfg.writeInterval/time.Millisecond))) * time.Millisecond
-	case "max_threads":
-		cfg.maxThreads = atoiDefault(value, cfg.maxThreads)
+	case "max_connections":
+		cfg.maxConnections = atoiDefault(value, cfg.maxConnections)
 	case "max_retry":
 		cfg.maxRetry = atoiDefault(value, cfg.maxRetry)
 	case "cut_left":
