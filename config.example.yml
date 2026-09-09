@@ -1,6 +1,6 @@
 common:
   key: "change-me"
-  request_template: null
+  request_template: null # Classic transport mode only; use the same template for generation and connection.
   max_read_size: 512
   udp_frag_size: 1200
 
@@ -31,8 +31,11 @@ connect:
   proxy: null
 
   async_connect: false
+  # Disable automatic PHP session-cookie discovery after the hello request.
   php_skip_cookie: false
-  go: false
+
+  # Force synchronous CONNECT/BIND/UDP setup, including URLs ending in .php.
+  sync_connect: false
   php_connect_timeout: 0.5
   local_dns: false
 
@@ -44,6 +47,7 @@ connect:
   auto_tune: false
 
   # Compression modes: optimal, dynamic, smart.
+  # smart compresses DATA only above the limit and below the entropy threshold.
   client_compression: "optimal"
   server_compression: "optimal"
   client_optimal_limit: 1024
@@ -51,7 +55,7 @@ connect:
 
   read_interval: 300
   write_interval: 200
-  max_threads: 400
+  max_connections: 400
   max_retry: 10
 
   cut_left: 0
