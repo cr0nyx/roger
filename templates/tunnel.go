@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"math"
 	"math/rand"
 	"net"
@@ -346,7 +347,7 @@ func base64encode(rawdata []byte) []byte {
 	return out
 }
 
-func blv_decode(data []byte) map[int][]byte {
+func blv_decode(data []byte) (map[int][]byte, error) {
 	info := make(map[int][]byte)
 	in := bytes.NewReader(data)
 	var b_byte byte
@@ -357,22 +358,34 @@ func blv_decode(data []byte) map[int][]byte {
 		if err != nil {
 			break
 		}
-		binary.Read(in, binary.BigEndian, &l_int32)
+		if err := binary.Read(in, binary.BigEndian, &l_int32); err != nil {
+			return nil, fmt.Errorf("truncated BLV length")
+		}
 		b := int(b_byte)
 		l := int(l_int32) - BLV_L_OFFSET
+		if l < 0 {
+			return nil, fmt.Errorf("invalid BLV length")
+		}
+		if l > in.Len() {
+			return nil, fmt.Errorf("truncated BLV value")
+		}
 
 		v := make([]byte, l)
-		in.Read(v)
+		if _, err := io.ReadFull(in, v); err != nil {
+			return nil, fmt.Errorf("truncated BLV value")
+		}
 		info[b] = v
 	}
 	if data, ok := info[DATA]; ok {
 		if _, compressed := info[DATACOMP]; compressed {
 			if out, err := zlibDecompress(data); err == nil {
 				info[DATA] = out
+			} else {
+				return nil, fmt.Errorf("invalid compressed DATA")
 			}
 		}
 	}
-	return info
+	return info, nil
 }
 
 func randbyte() []byte {
@@ -447,6 +460,29 @@ func writeClassicInfo(w http.ResponseWriter, info map[int][]byte, statusCode int
 	_, _ = w.Write(base64encode(data))
 }
 
+func failInfo(cmd string, mark string, err error) map[int][]byte {
+	msg := "unknown error"
+	if err != nil && err.Error() != "" {
+		msg = err.Error()
+	}
+	log.Printf("[%s] [%s] FAIL: %s", cmd, mark, msg)
+	return map[int][]byte{
+		STATUS: []byte("FAIL"),
+		ERROR:  []byte(msg),
+	}
+}
+
+func failInfoText(cmd string, mark string, msg string) map[int][]byte {
+	if msg == "" {
+		msg = "unknown error"
+	}
+	log.Printf("[%s] [%s] FAIL: %s", cmd, mark, msg)
+	return map[int][]byte{
+		STATUS: []byte("FAIL"),
+		ERROR:  []byte(msg),
+	}
+}
+
 func isLocalRedirectURL(rawURL string) bool {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
@@ -475,11 +511,9 @@ func isLocalRedirectURL(rawURL string) bool {
 }
 
 func relayClassicRequest(w http.ResponseWriter, r *http.Request, info map[int][]byte, head, tail []byte) bool {
+	mark := string(info[MARK])
 	if !redirectModeAllowed(info) {
-		writeClassicInfo(w, map[int][]byte{
-			STATUS: []byte("FAIL"),
-			ERROR:  []byte("Redirection is supported in classic mode only"),
-		}, HTTPCODE)
+		writeClassicInfo(w, failInfoText("REDIRECT", mark, "Redirection is supported in classic mode only"), HTTPCODE)
 		return true
 	}
 
@@ -498,7 +532,7 @@ func relayClassicRequest(w http.ResponseWriter, r *http.Request, info map[int][]
 
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, redirectURL, bytes.NewReader(body))
 	if err != nil {
-		writeClassicInfo(w, map[int][]byte{STATUS: []byte("FAIL"), ERROR: []byte(err.Error())}, HTTPCODE)
+		writeClassicInfo(w, failInfo("REDIRECT", mark, err), HTTPCODE)
 		return true
 	}
 	for key, values := range r.Header {
@@ -514,7 +548,7 @@ func relayClassicRequest(w http.ResponseWriter, r *http.Request, info map[int][]
 
 	response, err := http.DefaultClient.Do(req)
 	if err != nil {
-		writeClassicInfo(w, map[int][]byte{STATUS: []byte("FAIL"), ERROR: []byte(err.Error())}, HTTPCODE)
+		writeClassicInfo(w, failInfo("REDIRECT", mark, err), HTTPCODE)
 		return true
 	}
 	defer response.Body.Close()
@@ -957,7 +991,7 @@ func readStreamFrame(r io.Reader) (map[int][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return blv_decode(raw), nil
+	return blv_decode(raw)
 }
 
 func applyUplinkFrame(sess *session, info map[int][]byte) error {
@@ -1211,12 +1245,14 @@ func roger(w http.ResponseWriter, r *http.Request) {
 			if payload, err := reader.Peek(8 + frameLen); err == nil {
 				raw, err := base64decodeCompact(payload[8:])
 				if err == nil {
-					first := blv_decode(raw)
-					firstCmd := string(first[CMD])
-					if firstCmd == "DUPLEX" || firstCmd == "PROBE" {
-						reader.Discard(8 + frameLen)
-						handleFullDuplex(w, r, reader, first)
-						return
+					first, err := blv_decode(raw)
+					if err == nil {
+						firstCmd := string(first[CMD])
+						if firstCmd == "DUPLEX" || firstCmd == "PROBE" {
+							reader.Discard(8 + frameLen)
+							handleFullDuplex(w, r, reader, first)
+							return
+						}
 					}
 				}
 			}
@@ -1229,7 +1265,7 @@ func roger(w http.ResponseWriter, r *http.Request) {
 
 	if USE_REQUEST_TEMPLATE == 1 && len(data) > 0 {
 		if len(data) < START_INDEX+END_INDEX {
-			writeClassicInfo(w, map[int][]byte{STATUS: []byte("FAIL"), ERROR: []byte("Invalid request template body")}, HTTPCODE)
+			writeClassicInfo(w, failInfoText("REQUEST_TEMPLATE", "", "Invalid request template body"), HTTPCODE)
 			return
 		}
 		requestDataHead = append([]byte(nil), data[:START_INDEX]...)
@@ -1240,7 +1276,13 @@ func roger(w http.ResponseWriter, r *http.Request) {
 
 	out, err := base64decode(data)
 	if err == nil && len(out) != 0 {
-		info := blv_decode(out)
+		info, err := blv_decode(out)
+		if err != nil {
+			w.WriteHeader(HTTPCODE)
+			hello, _ := base64decode(roger_hello)
+			fmt.Fprintf(w, "%s", hello)
+			return
+		}
 		if len(info[REDIRECTURL]) > 0 {
 			if relayClassicRequest(w, r, info, requestDataHead, requestDataTail) {
 				return
@@ -1263,8 +1305,7 @@ func roger(w http.ResponseWriter, r *http.Request) {
 			if updateSessionSettings(mark, info) {
 				rinfo[STATUS] = []byte("OK")
 			} else {
-				rinfo[STATUS] = []byte("FAIL")
-				rinfo[ERROR] = []byte("Session is closed")
+				rinfo = failInfoText(cmd, mark, "Session is closed")
 			}
 		case "CONNECT":
 			ip := string(info[IP])
@@ -1275,8 +1316,7 @@ func roger(w http.ResponseWriter, r *http.Request) {
 				setSession(mark, newSession(conn, true, sessionSettingsFromRequest(mark, info)))
 				rinfo[STATUS] = []byte("OK")
 			} else {
-				rinfo[STATUS] = []byte("FAIL")
-				rinfo[ERROR] = []byte(err.Error())
+				rinfo = failInfo(cmd, mark, err)
 			}
 		case "BIND":
 			ip := string(info[IP])
@@ -1285,23 +1325,20 @@ func roger(w http.ResponseWriter, r *http.Request) {
 			addr := ip + ":" + port
 			l, err := net.Listen("tcp", addr)
 			if err != nil {
-				rinfo[STATUS] = []byte("FAIL")
-				rinfo[ERROR] = []byte(err.Error())
+				rinfo = failInfo(cmd, mark, err)
 				break
 			}
 			tcpListener, ok := l.(*net.TCPListener)
 			if !ok {
 				l.Close()
-				rinfo[STATUS] = []byte("FAIL")
-				rinfo[ERROR] = []byte("Invalid TCP listener")
+				rinfo = failInfoText(cmd, mark, "Invalid TCP listener")
 				break
 			}
 
 			host, port, ok := splitAddr(l.Addr().String())
 			if !ok {
 				l.Close()
-				rinfo[STATUS] = []byte("FAIL")
-				rinfo[ERROR] = []byte("Invalid bind address")
+				rinfo = failInfoText(cmd, mark, "Invalid bind address")
 				break
 			}
 
@@ -1353,8 +1390,7 @@ func roger(w http.ResponseWriter, r *http.Request) {
 			port := string(info[PORT])
 			addr, err := net.ResolveUDPAddr("udp", ip+":"+port)
 			if err != nil {
-				rinfo[STATUS] = []byte("FAIL")
-				rinfo[ERROR] = []byte(err.Error())
+				rinfo = failInfo(cmd, mark, err)
 				break
 			}
 			conn, err := net.ListenUDP("udp", addr)
@@ -1367,8 +1403,7 @@ func roger(w http.ResponseWriter, r *http.Request) {
 					rinfo[PORT] = []byte(port)
 				}
 			} else {
-				rinfo[STATUS] = []byte("FAIL")
-				rinfo[ERROR] = []byte(err.Error())
+				rinfo = failInfo(cmd, mark, err)
 			}
 		case "CHECK":
 			session := getSession(mark)
@@ -1403,12 +1438,10 @@ func roger(w http.ResponseWriter, r *http.Request) {
 				if err == nil {
 					rinfo[STATUS] = []byte("OK")
 				} else {
-					rinfo[STATUS] = []byte("FAIL")
-					rinfo[ERROR] = []byte(err.Error())
+					rinfo = failInfo(cmd, mark, err)
 				}
 			} else {
-				rinfo[STATUS] = []byte("FAIL")
-				rinfo[ERROR] = []byte("Session is closed")
+				rinfo = failInfoText(cmd, mark, "Session is closed")
 			}
 
 		case "READ":
@@ -1454,16 +1487,13 @@ func roger(w http.ResponseWriter, r *http.Request) {
 						rinfo[CMD] = []byte("SHUT_WR")
 					} else if remoteWriteClosed && !sess.settings.halfClose {
 						closeSession(mark, sess)
-						rinfo[STATUS] = []byte("FAIL")
-						rinfo[ERROR] = []byte("Session is closed")
+						rinfo = failInfoText(cmd, mark, "Session is closed")
 					} else if closed {
-						rinfo[STATUS] = []byte("FAIL")
-						rinfo[ERROR] = []byte("Session is closed")
+						rinfo = failInfoText(cmd, mark, "Session is closed")
 					}
 				}
 			} else {
-				rinfo[STATUS] = []byte("FAIL")
-				rinfo[ERROR] = []byte("Session is closed")
+				rinfo = failInfoText(cmd, mark, "Session is closed")
 			}
 
 		case "DOWNLINK":
@@ -1473,8 +1503,7 @@ func roger(w http.ResponseWriter, r *http.Request) {
 		case "SHUT_WR":
 			sess := getSession(mark)
 			if sess == nil || !sess.settings.halfClose {
-				rinfo[STATUS] = []byte("FAIL")
-				rinfo[ERROR] = []byte("Half-close mode is disabled")
+				rinfo = failInfoText(cmd, mark, "Half-close mode is disabled")
 				break
 			}
 			if sess != nil {
@@ -1482,12 +1511,10 @@ func roger(w http.ResponseWriter, r *http.Request) {
 				if err == nil {
 					rinfo[STATUS] = []byte("OK")
 				} else {
-					rinfo[STATUS] = []byte("FAIL")
-					rinfo[ERROR] = []byte(err.Error())
+					rinfo = failInfo(cmd, mark, err)
 				}
 			} else {
-				rinfo[STATUS] = []byte("FAIL")
-				rinfo[ERROR] = []byte("Session is closed")
+				rinfo = failInfoText(cmd, mark, "Session is closed")
 			}
 
 		case "DISCONNECT":

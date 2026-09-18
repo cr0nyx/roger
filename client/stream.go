@@ -250,7 +250,7 @@ func (s *session) iterFullDuplexFrames(reader *bufio.Reader, headers map[string]
 		for len(buffer) >= 8 {
 			frameLen, err := strconv.ParseInt(string(buffer[:8]), 16, 32)
 			if err != nil {
-				log.Printf("Stream frame length decode error: %v", err)
+				s.logf(3, "Stream frame length decode error: %v", err)
 				return false
 			}
 			if len(buffer) < 8+int(frameLen) {
@@ -260,7 +260,7 @@ func (s *session) iterFullDuplexFrames(reader *bufio.Reader, headers map[string]
 			buffer = buffer[8+int(frameLen):]
 			rinfo, err := s.client.codec.decodeStreamFrame(frame)
 			if err != nil {
-				log.Printf("Stream frame decode error: %v", err)
+				s.logf(3, "Stream frame decode error: %v", err)
 				return false
 			}
 			if !yield(rinfo) {
@@ -274,7 +274,7 @@ func (s *session) iterFullDuplexFrames(reader *bufio.Reader, headers map[string]
 func (c *client) probeFullDuplexMode() bool {
 	conn, reader, err := c.streamHTTPConnection()
 	if err != nil {
-		log.Printf("[PROBE] full failed: %v", err)
+		c.logf(3, "[PROBE] full failed: %v", err)
 		return false
 	}
 	defer conn.Close()
@@ -338,7 +338,7 @@ func (c *client) probeHTTP2StreamMode() bool {
 	_ = pw.Close()
 	select {
 	case err := <-errCh:
-		log.Printf("[PROBE] h2 failed: %v", err)
+		c.logf(3, "[PROBE] h2 failed: %v", err)
 		return false
 	case resp := <-respCh:
 		defer resp.Body.Close()
@@ -407,7 +407,7 @@ func (c *client) probeHTTP3StreamMode() bool {
 	_ = pw.Close()
 	select {
 	case err := <-errCh:
-		log.Printf("[PROBE] h3 failed: %v", err)
+		c.logf(3, "[PROBE] h3 failed: %v", err)
 		return false
 	case resp := <-respCh:
 		defer resp.Body.Close()
@@ -446,7 +446,7 @@ func (s *session) fullDuplexUpload(conn net.Conn, sendMu *sync.Mutex, remoteClos
 			}
 			s.requestCount++
 			s.recordTune(len(data), 0, 0)
-			log.Printf("[%s:%d] [%s] No.%d >>>> [%d byte]", s.target, s.port, s.mark, s.requestCount, len(data))
+			s.logf(2, "[%s:%d] [%s] No.%d >>>> [%d byte]", s.target, s.port, s.mark, s.requestCount, len(data))
 		}
 		if err != nil {
 			if s.client.cfg.halfClose {
@@ -524,7 +524,7 @@ func (s *session) fullDuplexUDPUpload(conn net.Conn, sendMu *sync.Mutex) {
 		}
 		s.requestCount++
 		s.recordTune(len(datagram.payload), 0, 0)
-		log.Printf("[%s:%d] [%s] No.%d >>>> [%d byte]", s.target, s.port, s.mark, s.requestCount, len(datagram.payload))
+		s.logf(2, "[%s:%d] [%s] No.%d >>>> [%d byte]", s.target, s.port, s.mark, s.requestCount, len(datagram.payload))
 	}
 }
 
@@ -551,7 +551,7 @@ func (s *session) http2StreamUpload(w io.WriteCloser, sendMu *sync.Mutex, remote
 			}
 			s.requestCount++
 			s.recordTune(len(data), 0, 0)
-			log.Printf("[%s:%d] [%s] No.%d >>>> [%d byte]", s.target, s.port, s.mark, s.requestCount, len(data))
+			s.logf(2, "[%s:%d] [%s] No.%d >>>> [%d byte]", s.target, s.port, s.mark, s.requestCount, len(data))
 		}
 		if err != nil {
 			if s.client.cfg.halfClose {
@@ -625,7 +625,7 @@ func (s *session) http2StreamUDPUpload(w io.Writer, sendMu *sync.Mutex) {
 		}
 		s.requestCount++
 		s.recordTune(len(datagram.payload), 0, 0)
-		log.Printf("[%s:%d] [%s] No.%d >>>> [%d byte]", s.target, s.port, s.mark, s.requestCount, len(datagram.payload))
+		s.logf(2, "[%s:%d] [%s] No.%d >>>> [%d byte]", s.target, s.port, s.mark, s.requestCount, len(datagram.payload))
 	}
 }
 

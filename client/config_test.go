@@ -27,6 +27,7 @@ connect:
     - https://relay.example/tunnel
   listen_port: 2080
   force_redirect: true
+  verbose: 2
   php_connect_timeout: 1.5
   read_interval: 25
   write_interval: 50
@@ -61,6 +62,9 @@ generate:
 	}
 	if cfg.port != 2080 || !cfg.forceRedirect {
 		t.Fatalf("connect options were not applied: port=%d force=%v", cfg.port, cfg.forceRedirect)
+	}
+	if cfg.verbose != 2 {
+		t.Fatalf("verbose = %d", cfg.verbose)
 	}
 	if cfg.phpConnectTimeout != 1500*time.Millisecond {
 		t.Fatalf("php timeout = %v", cfg.phpConnectTimeout)

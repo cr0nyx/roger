@@ -164,9 +164,9 @@ func (s *session) forwardUDPFragment(info map[string][]byte, index, count int) b
 			return true
 		}
 		if err != nil {
-			log.Printf("[UDP] FORWARD failed mark=%s fragment=%d/%d retry=%d/%d: %v", s.mark, index, count, retry, s.client.cfg.maxRetry, err)
+			s.logf(1, "[UDP] FORWARD failed mark=%s fragment=%d/%d retry=%d/%d: %v", s.mark, index, count, retry, s.client.cfg.maxRetry, err)
 		} else {
-			log.Printf("[UDP] FORWARD failed mark=%s fragment=%d/%d retry=%d/%d: status=%s error=%s", s.mark, index, count, retry, s.client.cfg.maxRetry, rinfo["STATUS"], rinfo["ERROR"])
+			s.logf(1, "[UDP] FORWARD failed mark=%s fragment=%d/%d retry=%d/%d: status=%s error=%s", s.mark, index, count, retry, s.client.cfg.maxRetry, rinfo["STATUS"], rinfo["ERROR"])
 		}
 		if retry < s.client.cfg.maxRetry {
 			time.Sleep(s.client.cfg.writeInterval)

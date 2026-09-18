@@ -38,6 +38,7 @@ func (s *session) handleSocks5() error {
 		if err := s.handleSocksAuth(br); err != nil {
 			return err
 		}
+		s.logf(1, "[SOCKS5] username/password authentication accepted")
 	} else {
 		if !hasSocksMethod(methods, socksNoAuth) {
 			_, _ = s.local.Write([]byte{socksVersion, socksNoMethod})
@@ -81,6 +82,7 @@ func (s *session) handleSocks5() error {
 			host = ips[0].String()
 		}
 	}
+	s.logf(1, "[SOCKS5] CMD=%d target=%s:%d", cmd, host, port)
 
 	switch cmd {
 	case 1:
@@ -100,8 +102,9 @@ func (s *session) handleSocks5() error {
 		if err := s.socksReply(socksOK, parseIPv4(ip, net.IPv4(0, 0, 0, 0)), bindPort); err != nil {
 			return err
 		}
-		peerIP, peerPort, err := s.waitBindPeer()
+		peerIP, peerPort, err := s.waitBindPeer(br)
 		if err != nil {
+			_ = s.socksReply(socksRefused, net.IPv4(0, 0, 0, 0), port)
 			return err
 		}
 		s.target, s.port = peerIP, peerPort

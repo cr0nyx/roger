@@ -109,7 +109,7 @@ func (s *session) maybeAutoTune() {
 	}
 	update["CMD"] = []byte("UPDATE_SETTINGS")
 	update["MARK"] = []byte(s.mark)
-	log.Printf("[AUTO-TUNE] [%s] updating settings: %v", s.mark, update)
+	s.logf(1, "[AUTO-TUNE] [%s] updating settings: %s", s.mark, logInfoSummary(update))
 	rinfo, err := s.client.request(update, 0)
 	if err != nil || string(rinfo["STATUS"]) != "OK" {
 		if err != nil {
@@ -134,7 +134,7 @@ func (s *session) maybeAutoTune() {
 	readBuf = s.readBuf
 	maxRead = s.maxReadSize
 	s.autoTuneMu.Unlock()
-	log.Printf("[AUTO-TUNE] [%s] applied READBUF=%d MAXREADSIZE=%d", s.mark, readBuf, maxRead)
+	s.logf(1, "[AUTO-TUNE] [%s] applied READBUF=%d MAXREADSIZE=%d", s.mark, readBuf, maxRead)
 }
 
 func minInt(a, b int) int {

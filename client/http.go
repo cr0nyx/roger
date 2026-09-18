@@ -66,7 +66,7 @@ func (c *client) capturePHPSessionCookie(resp *http.Response) error {
 	}
 	expiresAt, err := http.ParseTime(expires)
 	if err != nil {
-		log.Printf("[Ask Roger] Expires has an invalid format: %s", expires)
+		c.logf(1, "[Ask Roger] Expires has an invalid format: %s", expires)
 		return nil
 	}
 	if !expiresAt.Before(time.Now()) {
@@ -85,7 +85,7 @@ func (c *client) capturePHPSessionCookie(resp *http.Response) error {
 	}
 
 	c.headers.Set("Cookie", strings.Join(values, "; "))
-	log.Printf("[Ask Roger] Retained %d PHP session cookie(s)", len(values))
+	c.logf(1, "[Ask Roger] Retained %d PHP session cookie(s)", len(values))
 	return nil
 }
 
@@ -205,7 +205,9 @@ func (c *client) probeMode(mode string) bool {
 func (c *client) control(info map[string][]byte, timeout time.Duration) (map[string][]byte, error) {
 	c.addRedirect(info)
 	body := c.wrapRequestBody(c.codec.encodeBody(info))
-	req, err := c.newRequest(http.MethodPost, c.sampleURL(), strings.NewReader(body))
+	url := c.sampleURL()
+	c.logf(3, "[HTTP] control request url=%s info=%s body=%d bytes http_timeout=%s", url, logInfoSummary(info), len(body), timeout)
+	req, err := c.newRequest(http.MethodPost, url, strings.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -221,13 +223,19 @@ func (c *client) control(info map[string][]byte, timeout time.Duration) (map[str
 	if err != nil {
 		return nil, err
 	}
-	return c.codec.decodeBody(c.extractResponseBody(bytes.TrimSpace(data)))
+	rinfo, err := c.codec.decodeBody(c.extractResponseBody(bytes.TrimSpace(data)))
+	if err == nil {
+		c.logf(3, "[HTTP] control response status=%s info=%s body=%d bytes", resp.Status, logInfoSummary(rinfo), len(data))
+	}
+	return rinfo, err
 }
 
 func (c *client) request(info map[string][]byte, timeout time.Duration) (map[string][]byte, error) {
 	c.addRedirect(info)
 	body := c.wrapRequestBody(c.codec.encodeBody(info))
-	req, err := c.newRequest(http.MethodPost, c.sampleURL(), strings.NewReader(body))
+	url := c.sampleURL()
+	c.logf(3, "[HTTP] request url=%s info=%s body=%d bytes http_timeout=%s", url, logInfoSummary(info), len(body), timeout)
+	req, err := c.newRequest(http.MethodPost, url, strings.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -243,7 +251,11 @@ func (c *client) request(info map[string][]byte, timeout time.Duration) (map[str
 	if err != nil {
 		return nil, err
 	}
-	return c.codec.decodeBody(c.extractResponseBody(bytes.TrimSpace(data)))
+	rinfo, err := c.codec.decodeBody(c.extractResponseBody(bytes.TrimSpace(data)))
+	if err == nil {
+		c.logf(3, "[HTTP] response status=%s info=%s body=%d bytes", resp.Status, logInfoSummary(rinfo), len(data))
+	}
+	return rinfo, err
 }
 
 func (c *client) sampleURL() string {

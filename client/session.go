@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -107,13 +108,13 @@ func (c *client) handleRemoteForward() error {
 	if err != nil {
 		return err
 	}
-	log.Printf("[REMOTE FWD] Waiting for peer on %s:%d", bindIP, bindPort)
-	peerIP, peerPort, err := s.waitBindPeer()
+	c.logf(1, "[REMOTE FWD] Waiting for peer on %s:%d", bindIP, bindPort)
+	peerIP, peerPort, err := s.waitBindPeer(nil)
 	if err != nil {
 		s.closeNoLocal()
 		return err
 	}
-	log.Printf("[REMOTE FWD] Peer %s:%d connected, dialing local %s:%d", peerIP, peerPort, localHost, localPort)
+	c.logf(1, "[REMOTE FWD] Peer %s:%d connected, dialing local %s:%d", peerIP, peerPort, localHost, localPort)
 	local, err := net.Dial("tcp", net.JoinHostPort(localHost, strconv.Itoa(localPort)))
 	if err != nil {
 		s.closeNoLocal()
@@ -168,7 +169,7 @@ func (s *session) setupBind() (string, int, error) {
 		return "", 0, err
 	}
 	if string(rinfo["STATUS"]) != "OK" {
-		return "", 0, fmt.Errorf("BIND failed: %s", rinfo["ERROR"])
+		return "", 0, fmt.Errorf("BIND failed: %s", responseErrorText(rinfo))
 	}
 	ip := string(rinfo["IP"])
 	port, _ := strconv.Atoi(string(rinfo["PORT"]))
@@ -205,6 +206,7 @@ func (s *session) setupRequest(info map[string][]byte) error {
 	if s.isAsyncSetup() {
 		timeout = s.client.cfg.phpConnectTimeout
 	}
+	s.logf(1, "[%s] [%s] setup target=%s:%d mode=%s", info["CMD"], s.mark, s.target, s.port, s.activeMode)
 	rinfo, err := s.client.request(info, timeout)
 	if err != nil && s.isAsyncSetup() {
 		return nil
@@ -213,17 +215,39 @@ func (s *session) setupRequest(info map[string][]byte) error {
 		return err
 	}
 	if string(rinfo["STATUS"]) != "OK" {
-		return fmt.Errorf("%s failed: %s", info["CMD"], rinfo["ERROR"])
+		return fmt.Errorf("%s failed: %s", info["CMD"], responseErrorText(rinfo))
 	}
+	s.logf(1, "[%s] [%s] setup OK", info["CMD"], s.mark)
 	return nil
+}
+
+func responseErrorText(rinfo map[string][]byte) string {
+	if errText := strings.TrimSpace(string(rinfo["ERROR"])); errText != "" {
+		return errText
+	}
+	if status := strings.TrimSpace(string(rinfo["STATUS"])); status != "" {
+		return "server returned STATUS=" + status + " without ERROR field"
+	}
+	return "server returned failure without STATUS or ERROR fields"
 }
 
 func (s *session) isAsyncSetup() bool {
 	return !s.client.cfg.syncConnect && (s.client.cfg.asyncConnect || strings.Contains(s.client.cfg.urls[0], ".php"))
 }
 
-func (s *session) waitBindPeer() (string, int, error) {
+func (s *session) waitBindPeer(br *bufio.Reader) (string, int, error) {
+	if br != nil {
+		defer func() {
+			_ = s.local.SetReadDeadline(time.Time{})
+		}()
+	}
+	maxPollSleep := time.Duration(300) * s.client.cfg.readInterval
+	s.logf(1, "[BIND] [%s] waiting for peer; each CHECK has http_timeout=5s, max_poll_sleep=%s", s.mark, maxPollSleep)
 	for i := 0; i < 300; i++ {
+		if br != nil && s.bindControlClosed(br) {
+			s.closeNoLocal()
+			return "", 0, errors.New("BIND cancelled: local SOCKS client disconnected")
+		}
 		rinfo, err := s.client.request(map[string][]byte{"CMD": []byte("CHECK"), "MARK": []byte(s.mark)}, 5*time.Second)
 		if err == nil && string(rinfo["STATUS"]) == "OK" && len(rinfo["IP"]) > 0 {
 			port, _ := strconv.Atoi(string(rinfo["PORT"]))
@@ -231,7 +255,26 @@ func (s *session) waitBindPeer() (string, int, error) {
 		}
 		time.Sleep(s.client.cfg.readInterval)
 	}
+	s.closeNoLocal()
 	return "", 0, errors.New("BIND peer did not connect")
+}
+
+func (s *session) bindControlClosed(br *bufio.Reader) bool {
+	if s.local == nil {
+		return true
+	}
+	_ = s.local.SetReadDeadline(time.Now().Add(time.Millisecond))
+	_, err := br.Peek(1)
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return false
+	}
+	return true
 }
 
 func (s *session) sessionInfo(cmd string) map[string][]byte {
@@ -278,7 +321,7 @@ func (s *session) writer() {
 			}
 			s.requestCount++
 			s.recordTune(len(data), 0, 0)
-			log.Printf("[%s:%d] [%s] No.%d >>>> [%d byte]", s.target, s.port, s.mark, s.requestCount, len(data))
+			s.logf(2, "[%s:%d] [%s] No.%d >>>> [%d byte]", s.target, s.port, s.mark, s.requestCount, len(data))
 		}
 		if err != nil {
 			if s.client.cfg.halfClose && s.cmd != "UDP" {
@@ -408,7 +451,7 @@ func (s *session) handleDownlinkInfo(rinfo map[string][]byte) bool {
 		}
 		s.replyCount++
 		s.recordTune(0, len(data), 0)
-		log.Printf("[%s:%d] [%s] No.%d <<<< [%d byte]", s.target, s.port, s.mark, s.replyCount, len(data))
+		s.logf(2, "[%s:%d] [%s] No.%d <<<< [%d byte]", s.target, s.port, s.mark, s.replyCount, len(data))
 	}
 	if remoteWriteClosed {
 		if tcp, ok := s.local.(*net.TCPConn); ok {
@@ -432,7 +475,7 @@ func (s *session) shutdownRemoteWrite() error {
 		return err
 	}
 	if string(rinfo["STATUS"]) != "OK" {
-		return fmt.Errorf("SHUT_WR failed: %s", rinfo["ERROR"])
+		return fmt.Errorf("SHUT_WR failed: %s", responseErrorText(rinfo))
 	}
 	s.halfMu.Lock()
 	s.localEOF = true

@@ -43,7 +43,7 @@ connect:
   udp_max_size: 256
   udp_timeout: 30
   # Transport modes: auto, classic, half-duplex, full-duplex, h2, h3.
-  mode: "auto"
+  mode: "classic"
   auto_tune: false
 
   # Compression modes: optimal, dynamic, smart.

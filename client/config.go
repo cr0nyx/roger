@@ -15,7 +15,7 @@ func parseFlags() *config {
 	var urls multiFlag
 	var headers multiFlag
 	var redirectURLs multiFlag
-	var verbose countFlag
+	var cliVerbose countFlag
 	configPath, args := parseConfigArg(os.Args[1:])
 	cfg := defaultConfig()
 	if configPath != "" {
@@ -46,9 +46,9 @@ func parseFlags() *config {
 			{[]string{"-p", "--listen-port"}, "listen port", cfg.port},
 			{[]string{"-t", "--target"}, "fixed forwarding target IP:PORT", cfg.target},
 			{[]string{"--remote"}, "use -l/-p as server-side BIND listener and -t as local forwarding target", cfg.remote},
-			{[]string{"--tun"}, "enable TUN mode with this interface name", cfg.tunName},
-			{[]string{"--tun-cidr"}, "assign CIDR address to TUN interface", cfg.tunCIDR},
-			{[]string{"--tun-mtu"}, "TUN MTU", cfg.tunMTU},
+			{[]string{"--tun"}, "enable TUN mode with this interface name (experimental)", cfg.tunName},
+			{[]string{"--tun-cidr"}, "assign CIDR address to TUN interface (experimental)", cfg.tunCIDR},
+			{[]string{"--tun-mtu"}, "TUN MTU (experimental)", cfg.tunMTU},
 			{[]string{"-s", "--skip"}, "skip Roger hello check", cfg.skip},
 			{[]string{"-R", "--force-redirect"}, "force redirect", cfg.forceRedirect},
 			{[]string{"-c", "--cookie"}, "custom init cookies", cfg.cookie},
@@ -147,9 +147,11 @@ func parseFlags() *config {
 	var blacklist string
 	blacklist = strings.Join(cfg.blacklist, ",")
 	fs.StringVar(&blacklist, "blacklist", "", "SOCKS5-only comma-separated host wildcards")
-	fs.Var(&verbose, "v", "increase verbosity")
+	fs.Var(&cliVerbose, "v", "increase verbosity")
 	_ = fs.Parse(expandVerbosityArgs(args))
-	cfg.verbose = int(verbose)
+	if cliVerbose > 0 {
+		cfg.verbose = int(cliVerbose)
+	}
 	cfg.urls = urls
 	cfg.headers = headers
 	cfg.redirectURLs = redirectURLs
@@ -290,7 +292,7 @@ func defaultConfig() *config {
 		udpFragSize:        1200,
 		udpMaxSize:         256 * 1024,
 		udpTimeout:         30,
-		mode:               "auto",
+		mode:               "classic",
 		phpConnectTimeout:  500 * time.Millisecond,
 		clientCompression:  "optimal",
 		serverCompression:  "optimal",
@@ -474,6 +476,8 @@ func applyConfigValue(cfg *config, key, value string) {
 		cfg.tunMTU = atoiDefault(value, cfg.tunMTU)
 	case "skip":
 		cfg.skip = parseBool(value)
+	case "verbose":
+		cfg.verbose = atoiDefault(value, cfg.verbose)
 	case "force_redirect":
 		cfg.forceRedirect = parseBool(value)
 	case "cookie":
