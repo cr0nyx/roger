@@ -8,7 +8,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math"
 	"math/rand"
@@ -59,6 +58,25 @@ var (
 
 	lock sync.Mutex
 )
+
+const (
+	MAX_RAW_DATA_SIZE       = 1024 * 1024
+	MAX_STREAM_FRAME_SIZE   = 2 * 1024 * 1024
+	MAX_HTTP_BODY_SIZE      = 3 * 1024 * 1024
+	MAX_REDIRECT_BODY_SIZE  = 4 * 1024 * 1024
+)
+
+func readLimited(r io.Reader, limit int64) ([]byte, error) {
+	var out bytes.Buffer
+	n, err := io.CopyN(&out, r, limit+1)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	if n > limit {
+		return nil, fmt.Errorf("body exceeds %d bytes", limit)
+	}
+	return out.Bytes(), nil
+}
 
 type sessionSettings struct {
 	readbuf     int
@@ -546,12 +564,18 @@ func relayClassicRequest(w http.ResponseWriter, r *http.Request, info map[int][]
 	}
 	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
 
-	response, err := http.DefaultClient.Do(req)
+		client := &http.Client{Timeout: 30 * time.Second}
+		response, err := client.Do(req)
 	if err != nil {
 		writeClassicInfo(w, failInfo("REDIRECT", mark, err), HTTPCODE)
 		return true
 	}
 	defer response.Body.Close()
+	responseBody, err := readLimited(response.Body, MAX_REDIRECT_BODY_SIZE)
+	if err != nil {
+		writeClassicInfo(w, failInfo("REDIRECT", mark, err), HTTPCODE)
+		return true
+	}
 	for key, values := range response.Header {
 		switch strings.ToLower(key) {
 		case "connection", "content-length", "keep-alive", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade":
@@ -562,7 +586,7 @@ func relayClassicRequest(w http.ResponseWriter, r *http.Request, info map[int][]
 		}
 	}
 	w.WriteHeader(response.StatusCode)
-	_, _ = io.Copy(w, response.Body)
+	_, _ = w.Write(responseBody)
 	return true
 }
 
@@ -629,7 +653,7 @@ func zlibDecompress(data []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer reader.Close()
-	return ioutil.ReadAll(reader)
+	return readLimited(reader, MAX_RAW_DATA_SIZE)
 }
 
 func newSession(conn net.Conn, tcp bool, sessSettings sessionSettings) *session {
@@ -980,7 +1004,7 @@ func readStreamFrame(r io.Reader) (map[int][]byte, error) {
 	if _, err := fmt.Sscanf(string(header), "%08x", &frameLen); err != nil {
 		return nil, err
 	}
-	if frameLen < 0 || frameLen > UDPMAXSIZE*2 {
+	if frameLen < 0 || frameLen > MAX_STREAM_FRAME_SIZE {
 		return nil, fmt.Errorf("invalid stream frame length")
 	}
 	payload := make([]byte, frameLen)
@@ -1241,7 +1265,7 @@ func roger(w http.ResponseWriter, r *http.Request) {
 	reader := bufio.NewReader(r.Body)
 	if header, err := reader.Peek(8); err == nil {
 		frameLen := 0
-		if _, err := fmt.Sscanf(string(header), "%08x", &frameLen); err == nil && frameLen >= 0 && frameLen <= UDPMAXSIZE*2 {
+			if _, err := fmt.Sscanf(string(header), "%08x", &frameLen); err == nil && frameLen >= 0 && frameLen <= MAX_STREAM_FRAME_SIZE {
 			if payload, err := reader.Peek(8 + frameLen); err == nil {
 				raw, err := base64decodeCompact(payload[8:])
 				if err == nil {
@@ -1259,7 +1283,11 @@ func roger(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	data, _ := ioutil.ReadAll(reader)
+	data, err := readLimited(reader, MAX_HTTP_BODY_SIZE)
+	if err != nil {
+		writeClassicInfo(w, failInfo("REQUEST", "", err), HTTPCODE)
+		return
+	}
 
 	var requestDataHead, requestDataTail []byte
 
@@ -1298,8 +1326,6 @@ func roger(w http.ResponseWriter, r *http.Request) {
 			rinfo[STATUS] = []byte("OK")
 			rinfo[MODES] = []byte("classic,half,full,h2,h3")
 		case "PROBE":
-			rinfo[STATUS] = []byte("OK")
-		case "SETTINGS":
 			rinfo[STATUS] = []byte("OK")
 		case "UPDATE_SETTINGS":
 			if updateSessionSettings(mark, info) {

@@ -188,6 +188,42 @@ func parseFlags() *config {
 		fmt.Fprintln(os.Stderr, "--max-connections must be greater than zero")
 		os.Exit(2)
 	}
+	if cfg.port < 1 || cfg.port > 65535 {
+		fmt.Fprintln(os.Stderr, "--port must be between 1 and 65535")
+		os.Exit(2)
+	}
+	if cfg.readBuf <= 0 {
+		fmt.Fprintln(os.Stderr, "--read-buff must be greater than zero")
+		os.Exit(2)
+	}
+	if cfg.maxReadSize <= 0 {
+		fmt.Fprintln(os.Stderr, "--max-read-size must be greater than zero")
+		os.Exit(2)
+	}
+	if cfg.udpFragSize <= 0 {
+		fmt.Fprintln(os.Stderr, "--udp-frag-size must be greater than zero")
+		os.Exit(2)
+	}
+	if cfg.udpMaxSize <= 0 {
+		fmt.Fprintln(os.Stderr, "--udp-max-size must be greater than zero")
+		os.Exit(2)
+	}
+	if cfg.udpTimeout <= 0 {
+		fmt.Fprintln(os.Stderr, "--udp-timeout must be greater than zero")
+		os.Exit(2)
+	}
+	if cfg.clientOptimalLimit < 0 || cfg.serverOptimalLimit < 0 {
+		fmt.Fprintln(os.Stderr, "compression limits must be zero or greater")
+		os.Exit(2)
+	}
+	if cfg.readInterval <= 0 || cfg.writeInterval <= 0 {
+		fmt.Fprintln(os.Stderr, "read/write intervals must be greater than zero")
+		os.Exit(2)
+	}
+	if cfg.maxRetry < 0 {
+		fmt.Fprintln(os.Stderr, "--max-retry must be zero or greater")
+		os.Exit(2)
+	}
 	if len(cfg.redirectURLs) > 0 && cfg.mode != "classic" && cfg.mode != "auto" {
 		fmt.Fprintln(os.Stderr, "--redirect-url supports --mode classic or auto only; auto uses classic when redirection is enabled")
 		os.Exit(2)

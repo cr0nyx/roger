@@ -16,6 +16,19 @@ import (
 	mrand "math/rand"
 )
 
+const maxStreamFrameSize = 2 * 1024 * 1024
+
+func parseStreamFrameLen(text string) (int, error) {
+	n64, err := strconv.ParseUint(text, 16, 32)
+	if err != nil {
+		return 0, err
+	}
+	if n64 > maxStreamFrameSize {
+		return 0, fmt.Errorf("stream frame too large: %d", n64)
+	}
+	return int(n64), nil
+}
+
 func newCodec(key string, cfg *config) (*codec, error) {
 	r := newRogerRand(key)
 	blvOffset := int32(r.getrandbits(31).Int64())
@@ -113,11 +126,11 @@ func (c *codec) readStreamFrame(r *bufio.Reader) (map[string][]byte, error) {
 	if _, err := io.ReadFull(r, prefix); err != nil {
 		return nil, err
 	}
-	n64, err := strconv.ParseInt(string(prefix), 16, 32)
+	n, err := parseStreamFrameLen(string(prefix))
 	if err != nil {
 		return nil, err
 	}
-	payload := make([]byte, int(n64))
+	payload := make([]byte, n)
 	if _, err := io.ReadFull(r, payload); err != nil {
 		return nil, err
 	}
@@ -277,5 +290,5 @@ func zlibDecompress(data []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer r.Close()
-	return io.ReadAll(r)
+	return readLimited(r, maxHTTPResponseSize)
 }

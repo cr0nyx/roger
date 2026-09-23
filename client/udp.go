@@ -16,6 +16,8 @@ type socksUDPDatagram struct {
 	payload []byte
 }
 
+const udpReassemblyTTL = 30 * time.Second
+
 func (s *session) udpWriter() {
 	defer s.close()
 	buf := make([]byte, 65535)
@@ -23,6 +25,9 @@ func (s *session) udpWriter() {
 		_ = s.udpConn.SetReadDeadline(time.Now().Add(time.Second))
 		n, addr, err := s.udpConn.ReadFromUDP(buf)
 		if err != nil {
+			if s.isClosed() || errors.Is(err, net.ErrClosed) {
+				return
+			}
 			if time.Since(s.lastUDPUse) > time.Duration(s.client.cfg.udpTimeout)*time.Second {
 				return
 			}
@@ -212,6 +217,12 @@ func (s *session) reassembleUDP(data, meta []byte) []byte {
 	if len(meta) == 0 {
 		return data
 	}
+	now := time.Now()
+	for id, entry := range s.udpReasm {
+		if now.Sub(entry.created) > udpReassemblyTTL {
+			delete(s.udpReasm, id)
+		}
+	}
 	if len(meta) != 12 {
 		return nil
 	}
@@ -224,7 +235,7 @@ func (s *session) reassembleUDP(data, meta []byte) []byte {
 	}
 	entry := s.udpReasm[id]
 	if entry == nil {
-		entry = &udpReasmEntry{count: count, total: total, parts: map[uint16][]byte{}}
+		entry = &udpReasmEntry{count: count, total: total, created: now, parts: map[uint16][]byte{}}
 		s.udpReasm[id] = entry
 	}
 	entry.parts[idx] = append([]byte(nil), data...)

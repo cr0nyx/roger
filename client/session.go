@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -164,7 +165,7 @@ func (s *session) setupBind() (string, int, error) {
 		_ = s.setupRequest(info)
 		return s.target, s.port, nil
 	}
-	rinfo, err := s.client.request(info, 0)
+	rinfo, err := s.request(info, 0)
 	if err != nil {
 		return "", 0, err
 	}
@@ -207,7 +208,7 @@ func (s *session) setupRequest(info map[string][]byte) error {
 		timeout = s.client.cfg.phpConnectTimeout
 	}
 	s.logf(1, "[%s] [%s] setup target=%s:%d mode=%s", info["CMD"], s.mark, s.target, s.port, s.activeMode)
-	rinfo, err := s.client.request(info, timeout)
+	rinfo, err := s.request(info, timeout)
 	if err != nil && s.isAsyncSetup() {
 		return nil
 	}
@@ -219,6 +220,24 @@ func (s *session) setupRequest(info map[string][]byte) error {
 	}
 	s.logf(1, "[%s] [%s] setup OK", info["CMD"], s.mark)
 	return nil
+}
+
+func (s *session) request(info map[string][]byte, timeout time.Duration) (map[string][]byte, error) {
+	ctx, cancel := s.context()
+	defer cancel()
+	return s.client.requestContext(ctx, info, timeout)
+}
+
+func (s *session) context() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-s.closed:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
 }
 
 func responseErrorText(rinfo map[string][]byte) string {
@@ -248,7 +267,7 @@ func (s *session) waitBindPeer(br *bufio.Reader) (string, int, error) {
 			s.closeNoLocal()
 			return "", 0, errors.New("BIND cancelled: local SOCKS client disconnected")
 		}
-		rinfo, err := s.client.request(map[string][]byte{"CMD": []byte("CHECK"), "MARK": []byte(s.mark)}, 5*time.Second)
+		rinfo, err := s.request(map[string][]byte{"CMD": []byte("CHECK"), "MARK": []byte(s.mark)}, 5*time.Second)
 		if err == nil && string(rinfo["STATUS"]) == "OK" && len(rinfo["IP"]) > 0 {
 			port, _ := strconv.Atoi(string(rinfo["PORT"]))
 			return string(rinfo["IP"]), port, nil
@@ -314,7 +333,7 @@ func (s *session) writer() {
 		if n > 0 {
 			data := append([]byte(nil), buf[:n]...)
 			info := map[string][]byte{"CMD": []byte("FORWARD"), "MARK": []byte(s.mark), "DATA": data}
-			rinfo, reqErr := s.client.request(info, 0)
+			rinfo, reqErr := s.request(info, 0)
 			if reqErr != nil || string(rinfo["STATUS"]) != "OK" {
 				s.recordTune(0, 0, 1)
 				return
@@ -349,7 +368,7 @@ func (s *session) classicReader() {
 			return
 		default:
 		}
-		rinfo, err := s.client.request(map[string][]byte{"CMD": []byte("READ"), "MARK": []byte(s.mark)}, 0)
+		rinfo, err := s.request(map[string][]byte{"CMD": []byte("READ"), "MARK": []byte(s.mark)}, 0)
 		if err != nil || string(rinfo["STATUS"]) != "OK" {
 			return
 		}
@@ -384,6 +403,9 @@ func (s *session) halfDownlinkReader() {
 	if err != nil {
 		return
 	}
+	ctx, cancel := s.context()
+	defer cancel()
+	req = req.WithContext(ctx)
 	req.Header = cloneHeader(s.client.headers)
 	if s.client.cfg.httpVersion != "2" {
 		req.Header.Set("Connection", "close")
@@ -470,7 +492,7 @@ func (s *session) shutdownRemoteWrite() error {
 		return errors.New("half-close mode is disabled")
 	}
 	info := map[string][]byte{"CMD": []byte("SHUT_WR"), "MARK": []byte(s.mark)}
-	rinfo, err := s.client.request(info, 0)
+	rinfo, err := s.request(info, 0)
 	if err != nil {
 		return err
 	}

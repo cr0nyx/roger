@@ -18,12 +18,12 @@ type pyRand struct {
 func newRogerRand(key string) *pyRand {
 	salt := "11f271c6lm0e9ypkptad1uv6e1ut1fu0pt4xillz1w9bbs2gegbv89z9gca9d6tbk025uvgjfr331o0szln"
 	keyMin := 28
-	keyHash := key
+	keyBytes := []byte(key)
 	if len(key) < keyMin {
 		h := md5.Sum([]byte(salt[:keyMin] + key + salt[keyMin:]))
-		keyHash = hex.EncodeToString(h[:])
+		keyBytes = []byte(hex.EncodeToString(h[:])[:keyMin])
 	}
-	seedBytes := []byte(hex.EncodeToString([]byte(keyHash[:keyMin])))
+	seedBytes := []byte(hex.EncodeToString(keyBytes))
 	seed := new(big.Int)
 	seed.SetString(string(seedBytes), 16)
 	a := base36(salt[:keyMin])

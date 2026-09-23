@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -97,6 +98,18 @@ func TestCodecStreamFrameRoundTrip(t *testing.T) {
 	}
 	if string(decoded["CMD"]) != "DATA" || string(decoded["MARK"]) != "stream-mark" || string(decoded["DATA"]) != "abc123" {
 		t.Fatalf("unexpected decoded stream frame: %#v", decoded)
+	}
+}
+
+func TestReadStreamFrameRejectsInvalidLengths(t *testing.T) {
+	c := newTestCodec(t, nil)
+	for _, prefix := range []string{"-000001", "ffffffff"} {
+		t.Run(prefix, func(t *testing.T) {
+			_, err := c.readStreamFrame(bufio.NewReader(strings.NewReader(prefix)))
+			if err == nil {
+				t.Fatalf("expected %q stream frame length to fail", prefix)
+			}
+		})
 	}
 }
 

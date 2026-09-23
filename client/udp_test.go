@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"net"
 	"testing"
+	"time"
 )
 
 func TestParseSocksUDPDatagram(t *testing.T) {
@@ -143,5 +144,24 @@ func TestUDPFragmentationAndReassembly(t *testing.T) {
 	binary.BigEndian.PutUint32(meta[8:12], uint32(cfg.udpMaxSize+1))
 	if got := s.reassembleUDP([]byte("too-big"), meta); got != nil {
 		t.Fatalf("oversized reassembly should be rejected")
+	}
+}
+
+func TestUDPReassemblyExpiresIncompleteFragments(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.udpMaxSize = 1024
+	s := &session{client: &client{cfg: cfg}, udpReasm: map[uint32]*udpReasmEntry{
+		99: &udpReasmEntry{count: 2, total: 10, created: time.Now().Add(-udpReassemblyTTL - time.Second), parts: map[uint16][]byte{0: []byte("old")}},
+	}}
+	meta := make([]byte, 12)
+	binary.BigEndian.PutUint32(meta[0:4], 1)
+	binary.BigEndian.PutUint16(meta[4:6], 0)
+	binary.BigEndian.PutUint16(meta[6:8], 2)
+	binary.BigEndian.PutUint32(meta[8:12], 10)
+	if got := s.reassembleUDP([]byte("new"), meta); got != nil {
+		t.Fatalf("first fragment should not complete reassembly")
+	}
+	if _, ok := s.udpReasm[99]; ok {
+		t.Fatalf("expired incomplete fragment set should be removed")
 	}
 }

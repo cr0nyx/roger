@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -13,6 +14,8 @@ import (
 
 	mrand "math/rand"
 )
+
+const maxHTTPResponseSize = 4 * 1024 * 1024
 
 func (c *client) askRoger() error {
 	method := http.MethodGet
@@ -36,7 +39,7 @@ func (c *client) askRoger() error {
 		return err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := readLimited(resp.Body, maxHTTPResponseSize)
 	if err != nil {
 		return err
 	}
@@ -44,15 +47,38 @@ func (c *client) askRoger() error {
 		return err
 	}
 	body = bytes.TrimSpace(body)
+	extracted := c.extractResponseBody(body)
 	hello := c.codec.currentHello()
 	switch {
-	case bytes.Equal(body, hello) || bytes.Contains(body, hello):
+	case bytes.Equal(extracted, hello):
 		c.serverVer = version
 	default:
+		if err := c.wrappedHelloError(body, hello); err != nil {
+			return err
+		}
 		return fmt.Errorf("Roger is not ready, unexpected response: %q", firstBytes(body, 120))
 	}
 	log.Printf("[Ask Roger] Roger says, 'All seems fine' (server: %s)", c.serverVer)
 	return nil
+}
+
+func (c *client) wrappedHelloError(body, hello []byte) error {
+	left := bytes.Index(body, hello)
+	if left < 0 {
+		return nil
+	}
+	right := len(body) - (left + len(hello))
+	args := []string{}
+	if left > 0 {
+		args = append(args, fmt.Sprintf("--cut-left %d", left))
+	}
+	if right > 0 {
+		args = append(args, fmt.Sprintf("--cut-right %d", right))
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	return fmt.Errorf("Roger is ready, but response body needs extraction offsets; use %s", strings.Join(args, " "))
 }
 
 func (c *client) capturePHPSessionCookie(resp *http.Response) error {
@@ -74,19 +100,44 @@ func (c *client) capturePHPSessionCookie(resp *http.Response) error {
 	}
 
 	cookies := resp.Cookies()
-	values := make([]string, 0, len(cookies))
+	merged := parseCookieHeader(c.headers.Get("Cookie"))
 	for _, cookie := range cookies {
 		if cookie.Name != "" {
-			values = append(values, cookie.Name+"="+cookie.Value)
+			merged[cookie.Name] = cookie.Value
 		}
 	}
-	if len(values) == 0 {
+	if len(cookies) == 0 && len(merged) == 0 {
 		return fmt.Errorf("PHP session response expired without setting a cookie")
 	}
+	if len(cookies) == 0 {
+		c.logf(1, "[Ask Roger] Reusing existing PHP session cookie(s)")
+		return nil
+	}
 
-	c.headers.Set("Cookie", strings.Join(values, "; "))
-	c.logf(1, "[Ask Roger] Retained %d PHP session cookie(s)", len(values))
+	c.headers.Set("Cookie", formatCookieHeader(merged))
+	c.logf(1, "[Ask Roger] Retained %d PHP session cookie(s)", len(cookies))
 	return nil
+}
+
+func parseCookieHeader(header string) map[string]string {
+	values := map[string]string{}
+	for _, part := range strings.Split(header, ";") {
+		name, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if ok && name != "" {
+			values[name] = value
+		}
+	}
+	return values
+}
+
+func formatCookieHeader(values map[string]string) string {
+	parts := make([]string, 0, len(values))
+	for name, value := range values {
+		if name != "" {
+			parts = append(parts, name+"="+value)
+		}
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (c *client) negotiateMode() string {
@@ -219,7 +270,7 @@ func (c *client) control(info map[string][]byte, timeout time.Duration) (map[str
 		return nil, err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := readLimited(resp.Body, maxHTTPResponseSize)
 	if err != nil {
 		return nil, err
 	}
@@ -231,6 +282,10 @@ func (c *client) control(info map[string][]byte, timeout time.Duration) (map[str
 }
 
 func (c *client) request(info map[string][]byte, timeout time.Duration) (map[string][]byte, error) {
+	return c.requestContext(context.Background(), info, timeout)
+}
+
+func (c *client) requestContext(ctx context.Context, info map[string][]byte, timeout time.Duration) (map[string][]byte, error) {
 	c.addRedirect(info)
 	body := c.wrapRequestBody(c.codec.encodeBody(info))
 	url := c.sampleURL()
@@ -239,6 +294,7 @@ func (c *client) request(info map[string][]byte, timeout time.Duration) (map[str
 	if err != nil {
 		return nil, err
 	}
+	req = req.WithContext(ctx)
 	req.Header = cloneHeader(c.headers)
 	client := *c.httpClient
 	client.Timeout = timeout
@@ -247,7 +303,7 @@ func (c *client) request(info map[string][]byte, timeout time.Duration) (map[str
 		return nil, err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := readLimited(resp.Body, maxHTTPResponseSize)
 	if err != nil {
 		return nil, err
 	}
@@ -256,6 +312,17 @@ func (c *client) request(info map[string][]byte, timeout time.Duration) (map[str
 		c.logf(3, "[HTTP] response status=%s info=%s body=%d bytes", resp.Status, logInfoSummary(rinfo), len(data))
 	}
 	return rinfo, err
+}
+
+func readLimited(r io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("response body exceeds limit: %d bytes", limit)
+	}
+	return data, nil
 }
 
 func (c *client) sampleURL() string {

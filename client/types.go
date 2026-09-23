@@ -188,9 +188,10 @@ type session struct {
 }
 
 type udpReasmEntry struct {
-	count int
-	total uint32
-	parts map[uint16][]byte
+	count   int
+	total   uint32
+	created time.Time
+	parts   map[uint16][]byte
 }
 
 func init() {

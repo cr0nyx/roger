@@ -15,6 +15,11 @@ import java.util.zip.Deflater;
 import java.util.zip.Inflater;
 
 public class roger implements HostnameVerifier, X509TrustManager, Runnable {
+    public static final int MAX_RAW_DATA_SIZE = 1024 * 1024;
+    public static final int MAX_STREAM_FRAME_SIZE = 2 * 1024 * 1024;
+    public static final int MAX_HTTP_BODY_SIZE = 3 * 1024 * 1024;
+    public static final int MAX_REDIRECT_BODY_SIZE = 4 * 1024 * 1024;
+
     private char[] en;
     private byte[] de;
 
@@ -288,7 +293,7 @@ public class roger implements HostnameVerifier, X509TrustManager, Runnable {
             in.unread(header);
             return null;
         }
-        if (frameLen < 0 || frameLen > 524288) {
+        if (frameLen < 0 || frameLen > MAX_STREAM_FRAME_SIZE) {
             in.unread(header);
             return null;
         }
@@ -318,7 +323,7 @@ public class roger implements HostnameVerifier, X509TrustManager, Runnable {
             return null;
         }
         int frameLen = Integer.parseInt(new String(header, "US-ASCII"), 16);
-        if (frameLen < 0 || frameLen > 524288) {
+        if (frameLen < 0 || frameLen > MAX_STREAM_FRAME_SIZE) {
             throw new IOException("Invalid stream frame length");
         }
         byte[] payload = readExact(in, frameLen);
@@ -584,7 +589,7 @@ public class roger implements HostnameVerifier, X509TrustManager, Runnable {
 
 
             Writer out = (Writer) invokeMethod(response, "getWriter", new Object[0]);
-            PushbackInputStream requestInput = new PushbackInputStream((InputStream) invokeMethod(request, "getInputStream", new Object[0]), 524296);
+            PushbackInputStream requestInput = new PushbackInputStream((InputStream) invokeMethod(request, "getInputStream", new Object[0]), MAX_STREAM_FRAME_SIZE + 8);
             Object[] firstStreamInfo = tryReadInitialStreamFrame(requestInput, new Integer(BLV_L_OFFSET));
             if (firstStreamInfo != null) {
                 handleFullDuplex(requestInput, out, firstStreamInfo, DATA, CMD, STATUS, ERROR, IP, PORT, UDPFRAG, READBUF, MAXREADSIZE, UDPFRAGSIZE, UDP_IDLE_TIMEOUT, HALF_CLOSE_MODE, UDPMAXSIZE, BLV_L_OFFSET);
@@ -602,6 +607,9 @@ public class roger implements HostnameVerifier, X509TrustManager, Runnable {
                 byte[] requestBuffer = new byte[4096];
                 int requestRead;
                 while ((requestRead = requestInput.read(requestBuffer)) != -1) {
+                    if (requestBody.size() + requestRead > MAX_HTTP_BODY_SIZE) {
+                        throw new IOException("HTTP request body exceeds " + MAX_HTTP_BODY_SIZE + " bytes");
+                    }
                     requestBody.write(requestBuffer, 0, requestRead);
                 }
                 inputData = new String(requestBody.toByteArray());
@@ -647,16 +655,8 @@ public class roger implements HostnameVerifier, X509TrustManager, Runnable {
                     conn.setRequestMethod(method);
                     conn.setDoOutput(true);
 
-                    // ignore ssl verify
-                    if (HttpsURLConnection.class.isInstance(conn)){
-                        ((HttpsURLConnection)conn).setHostnameVerifier(this);
-                        SSLContext ctx = SSLContext.getInstance("SSL");
-                        ctx.init(null, new TrustManager[] { this }, null);
-                        ((HttpsURLConnection)conn).setSSLSocketFactory(ctx.getSocketFactory());
-                    }
-
-                    // conn.setConnectTimeout(200);
-                    // conn.setReadTimeout(200);
+                    conn.setConnectTimeout(30000);
+                    conn.setReadTimeout(30000);
 
                     Enumeration enu = (Enumeration) invokeMethod(request, "getHeaderNames", new Object[0]);
                     List<String> keys = Collections.list(enu);
@@ -703,6 +703,9 @@ public class roger implements HostnameVerifier, X509TrustManager, Runnable {
                     byte[] buffer = new byte[1024];
                     ByteArrayOutputStream baos = new ByteArrayOutputStream();
                     while ((i = hin.read(buffer)) != -1) {
+                        if (baos.size() + i > MAX_REDIRECT_BODY_SIZE) {
+                            throw new IOException("Redirect response exceeds " + MAX_REDIRECT_BODY_SIZE + " bytes");
+                        }
                         byte[] data = new byte[i];
                         System.arraycopy(buffer, 0, data, 0, i);
                         baos.write(data);
@@ -726,8 +729,6 @@ public class roger implements HostnameVerifier, X509TrustManager, Runnable {
                     rinfo[STATUS] = "OK";
                     rinfo[MODES] = "classic,half,full";
                 } else if (cmd.compareTo("PROBE") == 0) {
-                    rinfo[STATUS] = "OK";
-                } else if (cmd.compareTo("SETTINGS") == 0) {
                     rinfo[STATUS] = "OK";
                 } else if (cmd.compareTo("UPDATE_SETTINGS") == 0) {
                     Object channel = sessions.get(mark);
@@ -1234,11 +1235,21 @@ public class roger implements HostnameVerifier, X509TrustManager, Runnable {
         ByteArrayInputStream dataInput = new ByteArrayInputStream(data);
 
         while ( i < data_len ) {
+            if (i + 5 > data_len) {
+                throw new IllegalArgumentException("short BLV item");
+            }
             b = dataInput.read();
-            dataInput.read(length, 0, length.length);
+            if (dataInput.read(length, 0, length.length) != length.length) {
+                throw new IllegalArgumentException("short BLV length");
+            }
             int l = bytesToInt(length) - offset;
+            if (l < 0 || l > data_len - i - 5) {
+                throw new IllegalArgumentException("invalid BLV length");
+            }
             byte[] v = new byte[l];
-            dataInput.read(v, 0, v.length);
+            if (dataInput.read(v, 0, v.length) != v.length) {
+                throw new IllegalArgumentException("short BLV value");
+            }
             i += ( 5 + l );
             if ( b > 1 && b <= 21 && b != 10 && b != 11 ) {
                 info[b] = new String(v);
@@ -1398,6 +1409,10 @@ public class roger implements HostnameVerifier, X509TrustManager, Runnable {
             int count = inflater.inflate(buffer);
             if (count == 0 && inflater.needsInput()) {
                 break;
+            }
+            if (output.size() + count > MAX_RAW_DATA_SIZE) {
+                inflater.end();
+                throw new IOException("Decompressed DATA exceeds " + MAX_RAW_DATA_SIZE + " bytes");
             }
             output.write(buffer, 0, count);
         }

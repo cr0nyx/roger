@@ -9,9 +9,14 @@ import (
 	"io"
 	"net"
 	"strings"
+	"time"
 )
 
+const socksHandshakeTimeout = 10 * time.Second
+
 func (s *session) handleSocks5() error {
+	_ = s.local.SetDeadline(time.Now().Add(socksHandshakeTimeout))
+	defer s.local.SetDeadline(time.Time{})
 	br := bufio.NewReader(s.local)
 	ver, err := br.ReadByte()
 	if err != nil {

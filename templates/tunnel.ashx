@@ -105,9 +105,13 @@ public class GenericHandler1 : IHttpAsyncHandler {
     public static readonly String MappedBase64Chars = "BASE64 CHARSLIST";
     public static readonly char[] Base64ToMapped = BuildCharMap(Base64Chars, MappedBase64Chars);
     public static readonly char[] MappedToBase64 = BuildCharMap(MappedBase64Chars, Base64Chars);
+    public const int MAX_RAW_DATA_SIZE = 1024 * 1024;
+    public const int MAX_HTTP_BODY_SIZE = 3 * 1024 * 1024;
+    public const int MAX_REDIRECT_BODY_SIZE = 4 * 1024 * 1024;
 
     public static byte[] ReadRequestBody(Stream input, int length) {
         if (length <= 0) return new byte[0];
+        if (length > MAX_HTTP_BODY_SIZE) throw new InvalidDataException("HTTP request body is too large");
         byte[] data = new byte[length];
         int offset = 0;
         while (offset < length) {
@@ -116,6 +120,18 @@ public class GenericHandler1 : IHttpAsyncHandler {
             offset += read;
         }
         return data;
+    }
+
+    public static string ReadLimitedText(Stream input, int limit) {
+        MemoryStream output = new MemoryStream();
+        byte[] buffer = new byte[4096];
+        int read;
+        while ((read = input.Read(buffer, 0, buffer.Length)) > 0) {
+            if (output.Length + read > limit)
+                throw new InvalidDataException("Response body is too large");
+            output.Write(buffer, 0, read);
+        }
+        return Encoding.GetEncoding("UTF-8").GetString(output.ToArray());
     }
 
     public static bool IsWouldBlock(SocketException ex) {
@@ -642,6 +658,8 @@ public class GenericHandler1 : IHttpAsyncHandler {
             byte[] buffer = new byte[4096];
             int read;
             while ((read = deflate.Read(buffer, 0, buffer.Length)) > 0) {
+                if (output.Length + read > MAX_RAW_DATA_SIZE)
+                    throw new InvalidDataException("Decompressed DATA is too large");
                 output.Write(buffer, 0, read);
             }
         }
@@ -855,6 +873,7 @@ public class GenericHandler1 : IHttpAsyncHandler {
             }
             Uri u = new Uri(rUrl);
             WebRequest request = WebRequest.Create(u);
+            request.Timeout = 30000;
             request.Method = context.Request.HttpMethod;
             foreach (string key in context.Request.Headers)
             {
@@ -880,8 +899,7 @@ public class GenericHandler1 : IHttpAsyncHandler {
                     context.Response.AddHeader(rkey, webHeader[i]);
             }
 
-            StreamReader repBody = new StreamReader(response.GetResponseStream(), Encoding.GetEncoding("UTF-8"));
-            string rbody = repBody.ReadToEnd();
+            string rbody = ReadLimitedText(response.GetResponseStream(), MAX_REDIRECT_BODY_SIZE);
             context.Response.AddHeader("Content-Length", rbody.Length.ToString());
             context.Response.Write(rbody);
             return;
@@ -895,8 +913,6 @@ public class GenericHandler1 : IHttpAsyncHandler {
                 rinfo[STATUS] = "OK";
                 rinfo[MODES] = "classic,half";
             } else if (cmd == "PROBE") {
-                rinfo[STATUS] = "OK";
-            } else if (cmd == "SETTINGS") {
                 rinfo[STATUS] = "OK";
             } else if (cmd == "UPDATE_SETTINGS") {
                 TunnelState state = GetState(context.Application, mark);

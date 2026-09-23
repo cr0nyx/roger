@@ -174,11 +174,11 @@ func iterFullDuplexBody(reader *bufio.Reader, headers map[string]string, yield f
 			if sizeText == "" {
 				continue
 			}
-			size64, err := strconv.ParseInt(sizeText, 16, 32)
+			size, err := parseStreamFrameLen(sizeText)
 			if err != nil {
 				return err
 			}
-			if size64 == 0 {
+			if size == 0 {
 				for {
 					trailer, err := reader.ReadString('\n')
 					if err != nil {
@@ -189,7 +189,7 @@ func iterFullDuplexBody(reader *bufio.Reader, headers map[string]string, yield f
 					}
 				}
 			}
-			chunk, err := readFullDuplexExact(reader, int(size64))
+			chunk, err := readFullDuplexExact(reader, size)
 			if err != nil {
 				return err
 			}
@@ -210,6 +210,9 @@ func iterFullDuplexBody(reader *bufio.Reader, headers map[string]string, yield f
 		remaining, err := strconv.Atoi(contentLength)
 		if err != nil {
 			return err
+		}
+		if remaining < 0 {
+			return fmt.Errorf("invalid negative content length: %d", remaining)
 		}
 		for remaining > 0 {
 			size := remaining
@@ -245,22 +248,25 @@ func iterFullDuplexBody(reader *bufio.Reader, headers map[string]string, yield f
 
 func (s *session) iterFullDuplexFrames(reader *bufio.Reader, headers map[string]string, yield func(map[string][]byte) bool) error {
 	buffer := []byte{}
-	return iterFullDuplexBody(reader, headers, func(chunk []byte) bool {
+	var frameErr error
+	err := iterFullDuplexBody(reader, headers, func(chunk []byte) bool {
 		buffer = append(buffer, chunk...)
 		for len(buffer) >= 8 {
-			frameLen, err := strconv.ParseInt(string(buffer[:8]), 16, 32)
+			frameLen, err := parseStreamFrameLen(string(buffer[:8]))
 			if err != nil {
 				s.logf(3, "Stream frame length decode error: %v", err)
+				frameErr = err
 				return false
 			}
-			if len(buffer) < 8+int(frameLen) {
+			if len(buffer) < 8+frameLen {
 				break
 			}
-			frame := append([]byte(nil), buffer[8:8+int(frameLen)]...)
-			buffer = buffer[8+int(frameLen):]
+			frame := append([]byte(nil), buffer[8:8+frameLen]...)
+			buffer = buffer[8+frameLen:]
 			rinfo, err := s.client.codec.decodeStreamFrame(frame)
 			if err != nil {
 				s.logf(3, "Stream frame decode error: %v", err)
+				frameErr = err
 				return false
 			}
 			if !yield(rinfo) {
@@ -269,6 +275,10 @@ func (s *session) iterFullDuplexFrames(reader *bufio.Reader, headers map[string]
 		}
 		return true
 	})
+	if err != nil {
+		return err
+	}
+	return frameErr
 }
 
 func (c *client) probeFullDuplexMode() bool {
@@ -304,7 +314,7 @@ func (c *client) probeHTTP2StreamMode() bool {
 	pr, pw := io.Pipe()
 	defer pr.Close()
 	defer pw.Close()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	req, err := c.newRequest(http.MethodPost, c.sampleURL(), pr)
 	if err != nil {
@@ -331,11 +341,25 @@ func (c *client) probeHTTP2StreamMode() bool {
 		}
 	}()
 	frame := c.codec.encodeStreamFrame(map[string][]byte{"CMD": []byte("PROBE"), "MARK": []byte("__roger_probe__h2_go"), "MODE": []byte("h2")})
-	if _, err := pw.Write(frame); err != nil {
-		_ = pw.Close()
+	writeCh := make(chan error, 1)
+	go func() {
+		_, err := pw.Write(frame)
+		if err == nil {
+			err = pw.Close()
+		}
+		writeCh <- err
+	}()
+	select {
+	case err := <-writeCh:
+		if err != nil {
+			_ = pw.Close()
+			return false
+		}
+	case <-ctx.Done():
+		_ = pw.CloseWithError(ctx.Err())
 		return false
 	}
-	_ = pw.Close()
+
 	select {
 	case err := <-errCh:
 		c.logf(3, "[PROBE] h2 failed: %v", err)
@@ -345,11 +369,25 @@ func (c *client) probeHTTP2StreamMode() bool {
 		if resp.ProtoMajor != 2 || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return false
 		}
-		reader := bufio.NewReader(resp.Body)
-		rinfo, err := c.codec.readStreamFrame(reader)
-		return err == nil && string(rinfo["STATUS"]) == "OK"
-	case <-time.After(5 * time.Second):
-		_ = pr.Close()
+		readCh := make(chan map[string][]byte, 1)
+		go func() {
+			reader := bufio.NewReader(resp.Body)
+			rinfo, err := c.codec.readStreamFrame(reader)
+			if err == nil {
+				readCh <- rinfo
+			} else {
+				readCh <- nil
+			}
+		}()
+		select {
+		case rinfo := <-readCh:
+			return rinfo != nil && string(rinfo["STATUS"]) == "OK"
+		case <-ctx.Done():
+			_ = resp.Body.Close()
+			return false
+		}
+	case <-ctx.Done():
+		_ = pr.CloseWithError(ctx.Err())
 		return false
 	}
 }
@@ -371,7 +409,7 @@ func (c *client) probeHTTP3StreamMode() bool {
 	pr, pw := io.Pipe()
 	defer pr.Close()
 	defer pw.Close()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	req, err := c.newRequest(http.MethodPost, c.sampleURL(), pr)
 	if err != nil {
@@ -400,11 +438,25 @@ func (c *client) probeHTTP3StreamMode() bool {
 		}
 	}()
 	frame := c.codec.encodeStreamFrame(map[string][]byte{"CMD": []byte("PROBE"), "MARK": []byte("__roger_probe__h3_go"), "MODE": []byte("h3")})
-	if _, err := pw.Write(frame); err != nil {
-		_ = pw.Close()
+	writeCh := make(chan error, 1)
+	go func() {
+		_, err := pw.Write(frame)
+		if err == nil {
+			err = pw.Close()
+		}
+		writeCh <- err
+	}()
+	select {
+	case err := <-writeCh:
+		if err != nil {
+			_ = pw.Close()
+			return false
+		}
+	case <-ctx.Done():
+		_ = pw.CloseWithError(ctx.Err())
 		return false
 	}
-	_ = pw.Close()
+
 	select {
 	case err := <-errCh:
 		c.logf(3, "[PROBE] h3 failed: %v", err)
@@ -414,11 +466,25 @@ func (c *client) probeHTTP3StreamMode() bool {
 		if resp.ProtoMajor != 3 || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return false
 		}
-		reader := bufio.NewReader(resp.Body)
-		rinfo, err := c.codec.readStreamFrame(reader)
-		return err == nil && string(rinfo["STATUS"]) == "OK"
-	case <-time.After(5 * time.Second):
-		_ = pr.Close()
+		readCh := make(chan map[string][]byte, 1)
+		go func() {
+			reader := bufio.NewReader(resp.Body)
+			rinfo, err := c.codec.readStreamFrame(reader)
+			if err == nil {
+				readCh <- rinfo
+			} else {
+				readCh <- nil
+			}
+		}()
+		select {
+		case rinfo := <-readCh:
+			return rinfo != nil && string(rinfo["STATUS"]) == "OK"
+		case <-ctx.Done():
+			_ = resp.Body.Close()
+			return false
+		}
+	case <-ctx.Done():
+		_ = pr.CloseWithError(ctx.Err())
 		return false
 	}
 }
@@ -492,6 +558,9 @@ func (s *session) fullDuplexUDPUpload(conn net.Conn, sendMu *sync.Mutex) {
 		_ = s.udpConn.SetReadDeadline(time.Now().Add(time.Second))
 		n, addr, err := s.udpConn.ReadFromUDP(buf)
 		if err != nil {
+			if s.isClosed() || errors.Is(err, net.ErrClosed) {
+				return
+			}
 			if time.Since(s.lastUDPUse) > time.Duration(s.client.cfg.udpTimeout)*time.Second {
 				return
 			}
@@ -593,6 +662,9 @@ func (s *session) http2StreamUDPUpload(w io.Writer, sendMu *sync.Mutex) {
 		_ = s.udpConn.SetReadDeadline(time.Now().Add(time.Second))
 		n, addr, err := s.udpConn.ReadFromUDP(buf)
 		if err != nil {
+			if s.isClosed() || errors.Is(err, net.ErrClosed) {
+				return
+			}
 			if time.Since(s.lastUDPUse) > time.Duration(s.client.cfg.udpTimeout)*time.Second {
 				return
 			}
@@ -686,6 +758,8 @@ func (s *session) fullDuplexExchange() bool {
 
 	if s.cmd != "UDP" && remoteEOF {
 		s.closeIfHalfComplete()
+	} else if !s.isClosed() && !succeeded {
+		s.close()
 	} else if !s.isClosed() && succeeded {
 		s.close()
 	}
@@ -696,7 +770,7 @@ func (s *session) http2StreamExchange() bool {
 	pr, pw := io.Pipe()
 	defer pr.Close()
 	defer pw.Close()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := s.context()
 	defer cancel()
 	req, err := s.client.newRequest(http.MethodPost, s.client.sampleURL(), pr)
 	if err != nil {
@@ -797,6 +871,8 @@ func (s *session) http2StreamExchange() bool {
 	remoteOnce.Do(func() { close(remoteClosed) })
 	if s.cmd != "UDP" && remoteEOF {
 		s.closeIfHalfComplete()
+	} else if !s.isClosed() && !succeeded {
+		s.close()
 	} else if !s.isClosed() && succeeded {
 		s.close()
 	}
@@ -807,7 +883,7 @@ func (s *session) http3StreamExchange() bool {
 	pr, pw := io.Pipe()
 	defer pr.Close()
 	defer pw.Close()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := s.context()
 	defer cancel()
 	req, err := s.client.newRequest(http.MethodPost, s.client.sampleURL(), pr)
 	if err != nil {
@@ -910,6 +986,8 @@ func (s *session) http3StreamExchange() bool {
 	remoteOnce.Do(func() { close(remoteClosed) })
 	if s.cmd != "UDP" && remoteEOF {
 		s.closeIfHalfComplete()
+	} else if !s.isClosed() && !succeeded {
+		s.close()
 	} else if !s.isClosed() && succeeded {
 		s.close()
 	}

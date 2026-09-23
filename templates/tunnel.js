@@ -31,6 +31,11 @@
   const MODEOPT = 21;
   const MODES = 22;
 
+  const MAX_RAW_DATA_SIZE = 1024 * 1024;
+  const MAX_STREAM_FRAME_SIZE = 2 * 1024 * 1024;
+  const MAX_HTTP_BODY_SIZE = 3 * 1024 * 1024;
+  const MAX_REDIRECT_BODY_SIZE = 4 * 1024 * 1024;
+
   const en = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   const de = "BASE64 CHARSLIST";
 
@@ -40,15 +45,21 @@
     const info = {};
     let i = 0;
     while (i < data.length) {
+      if (i + 5 > data.length) {
+        throw new Error('short BLV item');
+      }
       const b = data.readInt8(i);
       const l = data.readUInt32BE(i + 1) - BLV_L_OFFSET;
       i += 5;
+      if (l < 0 || i + l > data.length) {
+        throw new Error('invalid BLV length');
+      }
       let v = data.slice(i, i + l);
       i += l;
       info[b] = v;
     }
     if (info[DATA] && info[DATACOMP]) {
-      info[DATA] = zlib.inflateSync(info[DATA]);
+      info[DATA] = zlib.inflateSync(info[DATA], { maxOutputLength: MAX_RAW_DATA_SIZE });
     }
     return info;
   }
@@ -263,9 +274,33 @@
       for (const name of ['connection', 'content-length', 'keep-alive', 'proxy-connection', 'te', 'trailer', 'transfer-encoding', 'upgrade']) {
         delete responseHeaders[name];
       }
-      res.writeHead(upstream.statusCode || HTTPCODE, responseHeaders);
-      upstream.pipe(res);
+      const chunks = [];
+      let total = 0;
+      let tooLarge = false;
+      upstream.on('data', chunk => {
+        total += chunk.length;
+        if (total > MAX_REDIRECT_BODY_SIZE) {
+          tooLarge = true;
+          upstream.destroy(new Error(`redirect response exceeds ${MAX_REDIRECT_BODY_SIZE} bytes`));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      upstream.on('end', () => {
+        res.writeHead(upstream.statusCode || HTTPCODE, responseHeaders);
+        res.end(Buffer.concat(chunks));
+      });
+      upstream.on('error', error => {
+        if (tooLarge && !res.headersSent) {
+          sendRoger(res, { [STATUS]: 'FAIL', [ERROR]: error.message });
+        } else if (!res.headersSent) {
+          sendRoger(res, { [STATUS]: 'FAIL', [ERROR]: error.message });
+        } else {
+          res.end();
+        }
+      });
     });
+    relay.setTimeout(30000, () => relay.destroy(new Error('Redirect request timed out')));
     relay.on('error', error => {
       if (!res.headersSent) {
         sendRoger(res, { [STATUS]: 'FAIL', [ERROR]: error.message });
@@ -718,7 +753,7 @@
     const consumeFrames = () => {
       while (streamBuffer.length >= 8) {
         const frameLen = parseInt(streamBuffer.slice(0, 8).toString(), 16);
-        if (!Number.isFinite(frameLen) || frameLen < 0) {
+        if (!Number.isFinite(frameLen) || frameLen < 0 || frameLen > MAX_STREAM_FRAME_SIZE) {
           closeStream();
           res.end();
           return;
@@ -781,18 +816,18 @@
   }
 
   function handleClassicBody(req, res, body) {
-      let protocolBody = body;
-      let requestDataHead = '';
-      let requestDataTail = '';
+      let protocolBody = Buffer.isBuffer(body) ? body : Buffer.from(body);
+      let requestDataHead = Buffer.alloc(0);
+      let requestDataTail = Buffer.alloc(0);
       if (USE_REQUEST_TEMPLATE === 1 && body.length > 0) {
         if (body.length < START_INDEX + END_INDEX) {
           res.writeHead(400);
           res.end();
           return;
         }
-        requestDataHead = body.slice(0, START_INDEX);
-        requestDataTail = END_INDEX > 0 ? body.slice(body.length - END_INDEX) : '';
-        protocolBody = body.slice(START_INDEX, END_INDEX > 0 ? body.length - END_INDEX : undefined);
+        requestDataHead = body.subarray(0, START_INDEX);
+        requestDataTail = END_INDEX > 0 ? body.subarray(body.length - END_INDEX) : Buffer.alloc(0);
+        protocolBody = body.subarray(START_INDEX, END_INDEX > 0 ? body.length - END_INDEX : body.length);
       }
       const translated = strtr(protocolBody, de, en);
       const decoded = Buffer.from(translated, 'base64');
@@ -829,12 +864,6 @@
 
         case 'PROBE': {
           res._rogerSettings = settingsFromInfo(info);
-          rinfo[STATUS] = 'OK';
-          sendRoger(res, rinfo);
-          break;
-        }
-
-        case 'SETTINGS': {
           rinfo[STATUS] = 'OK';
           sendRoger(res, rinfo);
           break;
@@ -1251,10 +1280,33 @@
       }
   }
 
-  function handleRequest(req, res, initialBody = '') {
+  function handleRequest(req, res, initialBody = Buffer.alloc(0)) {
     let body = initialBody;
-    req.on('data', chunk => body += chunk.toString());
-    req.on('end', () => handleClassicBody(req, res, body));
+    let tooLarge = body.length > MAX_HTTP_BODY_SIZE;
+    if (tooLarge) {
+      res.writeHead(413);
+      res.end();
+      req.destroy();
+      return;
+    }
+    req.on('data', chunk => {
+      if (tooLarge) {
+        return;
+      }
+      body = Buffer.concat([body, chunk]);
+      if (body.length > MAX_HTTP_BODY_SIZE) {
+        tooLarge = true;
+        res.writeHead(413);
+        res.end();
+        req.destroy();
+      }
+    });
+    req.on('error', () => {});
+    req.on('end', () => {
+      if (!tooLarge) {
+        handleClassicBody(req, res, body);
+      }
+    });
   }
 
   function handleProtocolRequest(req, res) {
@@ -1266,7 +1318,7 @@
         return;
       }
       decided = true;
-      handleRequest(req, res, probeBuffer.toString());
+      handleRequest(req, res, probeBuffer);
     };
 
     req.on('data', chunk => {
@@ -1274,11 +1326,18 @@
         return;
       }
       probeBuffer = Buffer.concat([probeBuffer, chunk]);
+      if (probeBuffer.length > MAX_HTTP_BODY_SIZE) {
+        decided = true;
+        res.writeHead(413);
+        res.end();
+        req.destroy();
+        return;
+      }
       if (probeBuffer.length < 8) {
         return;
       }
       const frameLen = parseInt(probeBuffer.slice(0, 8).toString(), 16);
-      if (!Number.isFinite(frameLen) || frameLen < 0) {
+      if (!Number.isFinite(frameLen) || frameLen < 0 || frameLen > MAX_STREAM_FRAME_SIZE) {
         fallbackClassic();
         return;
       }
@@ -1302,7 +1361,7 @@
     req.on('end', () => {
       if (!decided) {
         decided = true;
-        handleClassicBody(req, res, probeBuffer.toString());
+        handleClassicBody(req, res, probeBuffer);
       }
     });
   }
